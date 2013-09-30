@@ -329,7 +329,9 @@ wal_disk_writer(int fd, void *state)
 		/* we're not running inside ev_loop, so update ev_now manually just before write */
 		ev_now_update();
 
-		while (tbuf_len(&rbuf) > sizeof(u32) && tbuf_len(&rbuf) >= *(u32 *)rbuf.ptr) {
+		while (tbuf_len(&rbuf) > sizeof(u32) && tbuf_len(&rbuf) >= *(u32 *)rbuf.ptr &&
+		       requests_processed < 1024)
+		{
 			u32 row_count = ((u32 *)rbuf.ptr)[1];
 			if (!io_failure && row_count > [writer->current_wal wet_rows_offset_available]) {
 				assert(requests_processed != 0);
