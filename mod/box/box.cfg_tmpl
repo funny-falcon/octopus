@@ -13,6 +13,7 @@ memcached_expire_full_sweep=3600
 object_space = [
   {
     enabled = -1, required
+    ignored = 0
     cardinality = -1
     estimated_rows = 0
     index = [
