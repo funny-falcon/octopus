@@ -692,12 +692,6 @@ box_prepare_update(BoxTxn *txn)
 	case INSERT:
 		txn->flags = read_u32(&data);
 		u32 cardinality = read_u32(&data);
-		if (txn->object_space->cardinality > 0
-		    && txn->object_space->cardinality != cardinality)
-		{
-			iproto_raise(ERR_CODE_ILLEGAL_PARAMS,
-				  "tuple cardinality must match object_space cardinality");
-		}
 		u32 data_len = tbuf_len(&data);
 		void *tuple_bytes = read_bytes(&data, data_len);
 		prepare_replace(txn, cardinality, tuple_bytes, data_len);
@@ -723,6 +717,13 @@ box_prepare_update(BoxTxn *txn)
 
 	if (txn->obj) {
 		struct box_tuple *tuple = box_tuple(txn->obj);
+		if (txn->object_space->cardinality > 0 &&
+		    txn->object_space->cardinality != tuple->cardinality)
+		{
+			iproto_raise(ERR_CODE_ILLEGAL_PARAMS,
+				     "tuple cardinality must match object_space cardinality");
+		}
+
 		if (!valid_tuple(tuple->cardinality, tuple->data, tuple->bsize))
 			iproto_raise(ERR_CODE_UNKNOWN_ERROR, "internal error");
 	}
