@@ -29,8 +29,9 @@ src-lua/net_cdef.lua: include/octopus_ev.h include/net_io.h include/iproto_def.h
 ifneq (,$(GRAPHITE_ADDR))
 src-lua += src-lua/graphite.lua
 src-lua/graphite.lua: extra/graphite.lua
-	$(E) "SED	$@"
-	$(Q)$(SED) 's/127\.0\.0\.1:2003/$(GRAPHITE_ADDR)/' < $^ > $@
+	$(E) "GEN	$@"
+	$(Q)echo "local graphite_addr = '$(GRAPHITE_ADDR)'" > $@
+	$(Q)$(CAT) $^ >> $@
 endif
 
 obj += src-lua/registry.o
