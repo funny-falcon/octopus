@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2010, 2011, 2012 Mail.RU
- * Copyright (C) 2010, 2011, 2012 Yuriy Vostrikov
+ * Copyright (C) 2010, 2011, 2012, 2014 Mail.RU
+ * Copyright (C) 2010, 2011, 2012, 2014 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -1712,6 +1712,8 @@ static void
 reload_config(struct octopus_cfg *old,
 	      struct octopus_cfg *new)
 {
+	primary_addr = cfg.primary_addr;
+
 	if (!old->wal_feeder_addr && !new->wal_feeder_addr)
 		return;
 
