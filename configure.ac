@@ -205,42 +205,47 @@ AC_COMPILE_IFELSE(
    AC_DEFINE([HAVE__BUILTIN_EXPECT], [1], [Define to 1 if the C compiler supports __builtin_expect])])
 AC_MSG_RESULT($ac_cv__builtin_expect)
 
-AC_MSG_CHECKING([whether the compiler supports __attribute__((cold))])
-ac_cv__attribute_cold=no
-CFLAGS_saved="$CFLAGS"
-CFLAGS="$CFLAGS -Werror"
-AC_COMPILE_IFELSE(
-  [AC_LANG_SOURCE([int __attribute__((cold)) x() { return 0;}])],
-  [ac_cv__attribute_cold=yes
-   AC_DEFINE([HAVE__ATTRIBUTE_COLD], [1], [Define to 1 if the C compiler supports __attribute__((cold))])])
-AC_MSG_RESULT($ac_cv__attribute_cold)
-CFLAGS="$CFLAGS_saved"
+AC_CC_FLAG_CHECK([-Werror], [WCFLAGS="-Werror $WCFLAGS"])
+AC_CC_FLAG_CHECK([-Wno-sign-compare], [WCFLAGS="-Wno-sign-compare $WCFLAGS"])
+AC_CC_FLAG_CHECK([-Wextra], [WCFLAGS="-Wextra $WCFLAGS"])
+AC_SUBST(WCFLAGS)
 
-AC_CC_FLAG_CHECK([-fno-stack-protector])
-AS_IF([test "x$ac_cv_no_stack_protector" == xyes]
-      [CFLAGS="$CFLAGS -fno-stack-protector"])
-AC_CC_FLAG_CHECK([-pipe])
-AS_IF([test "x$ac_cv_pipe" == xyes]
-      [CFLAGS="$CFLAGS -pipe"])
+XCFLAGS=-Wall
+AC_CC_FLAG_CHECK([-fno-stack-protector], [XCFLAGS="-fno-stack-protector $XCFLAGS"])
+AC_CC_FLAG_CHECK([-pipe], [XCFLAGS="-pipe $XCFLAGS"])
+AC_CC_FLAG_CHECK([-MD -MP], [XCFLAGS="-MD -MP $XCFLAGS"])
+AC_SUBST(XCFLAGS)
 
-AC_CC_FLAG_CHECK([-Werror], [CFLAGS_WARNS="-Werror $CFLAGS_WARNS"])
-AC_CC_FLAG_CHECK([-Wno-sign-compare], [CFLAGS_WARNS="-Wno-sign-compare $CFLAGS_WARNS"])
-AC_CC_FLAG_CHECK([-Wextra], [CFLAGS_WARNS="-Wextra $CFLAGS_WARNS"])
-AC_CC_FLAG_CHECK([-Wall], [CFLAGS_WARNS="-Wall $CFLAGS_WARNS"])
-AC_SUBST(CFLAGS_WARNS)
-
-AC_CC_FLAG_CHECK([-MD -MP])
-AS_IF([test $ac_cv_MD__MP == yes],
-      [CFLAGS="-MD -MP $CFLAGS"])
+AS_IF([test "x$ac_cv_werror" == xyes],
+      [AC_MSG_CHECKING([whether the compiler supports __attribute__((cold))])
+       ac_cv__attribute_cold=no
+       CFLAGS_saved="$CFLAGS"
+       CFLAGS="$CFLAGS -Werror"
+       AC_COMPILE_IFELSE(
+         [AC_LANG_SOURCE([int __attribute__((cold)) x() { return 0;}])],
+	 [ac_cv__attribute_cold=yes
+	 AC_DEFINE([HAVE__ATTRIBUTE_COLD], [1], [Define to 1 if the C compiler supports __attribute__((cold))])])
+       AC_MSG_RESULT($ac_cv__attribute_cold)
+       CFLAGS="$CFLAGS_saved"])
 
 dnl internal backtrace facility will resolve all dynamic symbols
 AC_CC_FLAG_CHECK([-Wl,--export-dynamic])
 AS_IF([test $ac_cv_Wl___export_dynamic == yes],
       [LDFLAGS="-Wl,--export-dynamic $LDFLAGS"])
 
-AC_CC_FLAG_CHECK([-Wno-comment], [AC_SUBST(HAVE_CC_FLAG_W_NO_COMMENT, 1)])
-AC_CC_FLAG_CHECK([-Wno-unused-value], [AC_SUBST(HAVE_CC_FLAG_W_NO_UNUSED_VALUE, 1)])
-AC_CC_FLAG_CHECK([-Wno-unused-parameter], [AC_SUBST(HAVE_CC_FLAG_W_NO_UNUSED_PARAMETER, 1)])
+host="`uname -n` `uname -s` `uname -r` `uname -m`"
+if test x"$GCC" = x"yes" ; then
+  cc_string=`${CC} --version | sed q`
+  case $cc_string in [[A-Za-z]]*) ;; *) cc_string="GCC $cc_string";; esac
+elif test x"$SUN_STUDIO_CC" = x"yes" ; then
+  cc_string=`${CC} -V 2>&1 | sed q`
+else
+  cc_string=$CC
+fi
+
+AC_DEFINE_UNQUOTED(OCT_BUILD_INFO,
+                   ["compiled by $cc_string on $host"],
+                   [A string containing C compiler and patform info])
 
 AC_ARG_ENABLE([coverage],
               [AS_HELP_STRING([--enable-coverage],
@@ -250,8 +255,8 @@ AS_IF([test "x$coverage" = xyes],
       [AC_CHECK_PROG([LCOV], [lcov], [lcov])
        AS_IF([test -n $LCOV], [AC_SUBST(HAVE_LCOV, 1)])
        AC_SUBST(COVERAGE, 1)
-       CFLAGS="--coverage $CFLAGS";
-       LDFLAGS="--coverage $LDFLAGS"])
+       XCFLAGS="--coverage $XCFLAGS";
+       XLDFLAGS="--coverage $XLDFLAGS"])
 
 AC_ARG_ENABLE([valgrind],
               [AS_HELP_STRING([--enable-valgrind],
@@ -260,14 +265,7 @@ AC_ARG_ENABLE([valgrind],
 AS_IF([test "x$valgrind" == xyes],
       [AS_IF([test $ac_cv_header_valgrind_valgrind_h == no],
              AC_MSG_ERROR([unable to find valgrind headers]))],
-      [CFLAGS="-DNVALGRIND $CFLAGS"])
-
-m4_include(modules.m4)
-AC_SUBST(modules, [$octopus_modules])
-for module in $octopus_modules; do
-    AS_IF([test -r ${srcdir}/mod/$module/Makefile], [], AC_MSG_ERROR([No such module: $module]))
-done
-
+      [AC_DEFINE(NVALGRIND, 1, [Define to 1 if Valgrind support should be disabled])])
 
 AC_ARG_ENABLE([clients],
               [AS_HELP_STRING([--enable-clients[[=libiproto]]],
@@ -275,8 +273,15 @@ AC_ARG_ENABLE([clients],
               [octopus_clients=$enableval],
               [octopus_clients="libiproto"])
 AC_SUBST(clients, [$octopus_clients])
+
+m4_include(modules.m4)
+AC_SUBST(modules, [$octopus_modules])
+
+for module in $octopus_modules; do
+    AS_IF([test -r "${srcdir}/mod/$module/Makefile"], [], AC_MSG_ERROR([No such module: $module]))
+done
 for client in $octopus_clients; do
-    AS_IF([test -r ${srcdir}/client/$client/Makefile], [], AC_MSG_ERROR([No such client: $client]))
+    AS_IF([test -r "${srcdir}/client/$client/Makefile"], [], AC_MSG_ERROR([No such client: $client]))
 done
 
 AC_OUTPUT
@@ -288,11 +293,11 @@ Modules enabled........$octopus_modules
 Clients enabled........$octopus_clients
 
 Objective C compiler...$CC
-CPPFLAGS...............$CPPFLAGS
 CFLAGS.................$CFLAGS
-CFLAGS_WARNS...........$CFLAGS_WARNS
-LDFLAGS................$LDFLAGS
+CPPFLAGS...............$CPPFLAGS
 LIBS...................$LIBS
+configured CFLAGS......$XCFLAGS $WCFLAGS
+configured LDFLAGS.....$XLDFLAGS
 
 Ragel..................$RAGEL
 Ragel flags............$RAGELFLAGS

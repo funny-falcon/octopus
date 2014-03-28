@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2010, 2011 Mail.RU
- * Copyright (C) 2010, 2011 Yuriy Vostrikov
+ * Copyright (C) 2010, 2011, 2012, 2013 Mail.RU
+ * Copyright (C) 2010, 2011, 2012, 2013 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -39,7 +39,7 @@ init_with_index:(Index *)_index
 {
 	[super init];
 	index = _index;
-	n = index->n;
+	memcpy(&conf, &_index->conf, sizeof(conf));
 	dtor = index->dtor;
 	dtor_arg = index->dtor_arg;
 	return self;
@@ -81,6 +81,12 @@ iterator_init:(struct tbuf *)key_data with_cardinalty:(u32)cardinality
 iterator_init_with_object:(struct tnt_object *)obj
 {
 	(void)obj;
+}
+
+- (void)
+iterator_init_with_node:(const struct index_node *)node
+{
+	(void)node;
 }
 
 - (struct tnt_object *)
@@ -131,6 +137,13 @@ remove:(struct tnt_object *)obj
 }
 
 - (struct tnt_object *)
+find:(const char *)key
+{
+	(void)key;
+	return NULL;
+}
+
+- (struct tnt_object *)
 find_key:(struct tbuf *)key_data with_cardinalty:(u32)cardinality
 {
 	(void)key_data;
@@ -142,6 +155,13 @@ find_key:(struct tbuf *)key_data with_cardinalty:(u32)cardinality
 find_by_obj:(struct tnt_object *)obj
 {
 	(void)obj;
+	return NULL;
+}
+
+- (struct tnt_object *)
+find_by_node:(const struct index_node *)node
+{
+	(void)node;
 	return NULL;
 }
 @end

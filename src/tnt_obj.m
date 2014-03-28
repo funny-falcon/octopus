@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2011, 2012 Mail.RU
- * Copyright (C) 2011, 2012 Yuriy Vostrikov
+ * Copyright (C) 2011, 2012, 2013 Mail.RU
+ * Copyright (C) 2011, 2012, 2013 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -44,7 +44,10 @@ object_alloc(u8 type, size_t size)
 	struct tnt_object *obj = salloc(sizeof(struct tnt_object) + size);
 
 	if (obj == NULL)
-		iproto_raise(ERR_CODE_MEMORY_ISSUE, "can't allocate object");
+		iproto_raise(ERR_CODE_MEMORY_ISSUE,
+			     salloc_error == ESALLOC_NOCACHE ?
+			     "bad object size":
+			     "can't allocate object");
 
 	obj->type = type;
 	obj->flags = obj->refs = 0;
@@ -77,8 +80,10 @@ object_decr_ref(struct tnt_object *obj)
 	assert(obj->refs - 1 >= 0);
 	obj->refs--;
 
-	if (obj->refs == 0)
+	if (obj->refs == 0) {
+		say_debug("object_decr_ref(%p) free", obj);
 		sfree(obj);
+	}
 }
 
 void

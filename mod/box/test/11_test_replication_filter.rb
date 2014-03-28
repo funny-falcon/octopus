@@ -10,6 +10,10 @@ class MasterEnv < StandAloneEnv
 
   def config
     super + <<EOD
+# normaly not needed. but because there is no WAL then test started (and thus no inotify watcher running),
+# feeder will sleep until WAL dir rescan.
+wal_dir_rescan_delay = 0.05
+
 wal_feeder_bind_addr = "0:33034"
 object_space[0].enabled = 1
 object_space[0].index[0].type = "HASH"
@@ -23,22 +27,38 @@ EOD
   file "feeder_init.lua" do
     f = open("feeder_init.lua", "w")
     f.write <<-EOD
-      function replication_filter.test_filter(obj)
-        local row = feeder.crow(obj)
-        print("row lsn:" .. tostring(row.lsn) ..
-              " scn:" .. tostring(row.scn) ..
-              " tag:" .. row.tag ..
-              " cookie:" .. tostring(row.cookie) ..
-              " tm:" .. row.tm)
+local wal = require 'wal'
+local box = require 'box.op'
 
-        if feeder.pass_tag[row.tag] then
-        	return true
-	end
-	if row.scn % 2 == 0 then
-         	return false
-        end
-        return true
+function replication_filter.test_filter(row)
+  print(row)
+
+  if row:tag_name() ~= 'wal_tag' and not row:tag_name():find('usr') then
+  	return true
+  end
+
+  if row.scn < 5 and row.scn % 2 == 0 then
+   	return false
+  end
+
+  local cmd = box.wal_parse(row.tag, row.data, row.len)
+  if not cmd then
+      print("can't parse cmd")
+      return true
+  end
+
+  if cmd.op == box.op.UPDATE_FIELDS then
+      for _, v in ipairs(cmd.update_mops) do
+          if v[2] == "add" then
+              v[3] = v[3] + 1  -- preserve type
+          end
       end
+
+      local _, data, len = box.pack.update(cmd.n, cmd.key:strfield(0), cmd.update_mops)
+      return row:update_data(data, len)
+  end
+  return true
+end
     EOD
     f.close
   end
@@ -80,13 +100,15 @@ MasterEnv.clean do
     slave = connect
 
 
-    4.times do |i|
-      master.insert [i]
+    6.times do |i|
+      master.insert [i, i]
     end
+    master.update_fields 4, [1, :add, 1]
+    master.update_fields 5, [1, :add, 1]
     sleep 0.1
 
-    master.select 0,1,2,3
-    slave.select 0,1,2,3
+    master.select 0,1,2,3,4,5
+    slave.select 0,1,2,3,5
 
     stop
     start

@@ -1,34 +1,151 @@
-
 local assert, error, print, type, pairs, ipairs, table, setmetatable, getmetatable =
       assert, error, print, type, pairs, ipairs, table, setmetatable, getmetatable
 
 local string, tostring, tonumber =
       string, tostring, tonumber
 
-local rawget = rawget
+local rawget, rawset = rawget, rawset
+local printf = printf
 
-local tou32, tofield = string.tou32, string.tofield
 
 local ffi, bit, debug = require("ffi"), require("bit"), require("debug")
-local net = require("net")
+local net, index = require("net"), require('index')
+local fiber = require("fiber")
+local object, object_cast, varint32, packer = object, object_cast, varint32, packer
+local safeptr, assertarg = safeptr, assertarg
+local lselect = select
+
+local dyn_tuple = require 'box.dyn_tuple'
+local box_op = require 'box.op'
+
+-- legacy, slow because of string interning
+ffi.cdef[[ typedef union { char ch[8]; u8 u8; u16 u16; u32 u32; u64 u64;} pack_it_gently ]]
+local ptg = ffi.new 'pack_it_gently'
+string.tou8 = function(i) ptg.u8 = tonumber(i); return ffi.string(ptg.ch, 1) end
+string.tou16 = function(i) ptg.u16 = tonumber(i); return ffi.string(ptg.ch, 2) end
+string.tou32 = function(i) ptg.u32 = tonumber(i); return ffi.string(ptg.ch, 4) end
+string.tou64 = function(i)
+    if type(i) == 'string' then
+        ptg.u64 = ffi.C.atoll(i)
+    else
+        ptg.u64 = i
+    end
+    return ffi.string(ptg.ch, 8)
+end
+string.tovarint32 = function(i)
+   local n = varint32.write(ptg.ch, tonumber(i))
+   return ffi.string(ptg.ch, n)
+end
+local bufn = 1024
+local buf = ffi.new('char[?]', bufn)
+string.tofield = function(s)
+   local need = 5 + #s
+   if bufn < need then
+       bufn = need
+       buf = ffi.new('char[?]', bufn)
+   end
+   local n = varint32.write(buf, #s)
+   ffi.copy(buf + n, s, #s)
+   return ffi.string(buf, n + #s)
+end
+
+local add_stat_exec_lua = function(name) end
+local add_stat_exec_lua_ok = function(name) end
+local add_stat_exec_lua_rcode = function(name, rcode) end
+if graphite then
+    local add_stat = stat.request_collector{name = 'exec_lua'}
+    graphite.add_cb('exec_lua')
+    add_stat_exec_lua = add_stat.add_run
+    add_stat_exec_lua_ok = add_stat.add_ok
+    add_stat_exec_lua_rcode = add_stat.add_rcode
+end
+
+local _G = _G
 module(...)
 
 user_proc = {}
 
+ffi.cdef[[
+struct object_space {
+	int n;
+	bool enabled, ignored;
+	int cardinality;
+	struct Index *index[10];
+};
+extern struct object_space *object_space_registry;
+extern const int object_space_count, object_space_max_idx;
+]]
+
+local maxidx = ffi.C.object_space_max_idx
+local index_registry_mt = {
+   __index = function (table, i)
+      i = tonumber(i)
+      if i < 0 or i >= maxidx or table.__object_space.index[i] == nil then
+	 return nil
+      end
+      if not rawget(table, i) then
+	 local legacy, new = index.cast(table.__object_space.index[i])
+	 table[i] = legacy
+      end
+      return rawget(table, i)
+   end,
+   __call = function (t, object_space, i)
+       i = tonumber(i)
+       if i < 0 or i >= maxidx or object_space.__ptr.index[i] == nil then
+	   return nil
+       end
+       if not rawget(t, i + maxidx) then
+	   local legacy, new = index.cast(object_space.__ptr.index[i])
+	   t[i + maxidx] = new
+       end
+
+       return rawget(t, i + maxidx)
+   end
+}
+
+local object_space_mt = {
+   __tostring = function(self)
+      return tostring(self.__ptr)
+   end
+}
+
+object_space_registry = setmetatable({}, {
+   __index = function(table, k)
+      local i
+      -- string and starts from digit
+      if type(k) == 'string' and 48 <= k:byte(1) and k:byte(1) <= 57 then
+	 i = tonumber(k)
+      else
+	 i = k
+      end
+
+      if type(i) ~= 'number' or
+	 i >= ffi.C.object_space_count or
+	 not ffi.C.object_space_registry[i].enabled or
+	 ffi.C.object_space_registry[i].ignored
+      then
+	 return nil
+      end
+
+      local ptr = ffi.C.object_space_registry[i]
+      local index_registry = setmetatable({ __object_space = ptr }, index_registry_mt)
+      local object_space = setmetatable({ __ptr = ptr,
+					  n = ptr.n,
+					  cardinality = ptr.cardinality,
+					  index = index_registry }, object_space_mt)
+      table[k] = object_space
+      return object_space
+   end
+})
+
+
 -- make useful aliases
-space = object_space
+space, object_space = object_space_registry, object_space_registry
 
-local object_space_mt = getmetatable(object_space) or {}
-assert(not object_space_mt.__index)
-object_space_mt.__index = function(table, i) return rawget(table, tonumber(i)) end
-setmetatable(object_space, object_space_mt)
 
-for n, v in pairs(object_space) do
-        v.index = {}
-        v.index.mt = {}
-        v.index.mt.__index = function (table, i) return index(n, i) end
-        setmetatable(v.index, v.index.mt)
-end
+-- install automatic cast of object() return value
+object_cast[dyn_tuple.obj_type] = dyn_tuple.obj_cast
+
 
 function select(n, ...)
         local index = object_space[n].index[0]
@@ -39,258 +156,123 @@ function select(n, ...)
         return result
 end
 
-function replace(n, ...)
-        local tuple = {...}
-        local flags = 0
-        local req = {}
-
-        table.insert(req, tou32(n))
-        table.insert(req, tou32(flags))
-        table.insert(req, tou32(#tuple))
-        for k, v in pairs(tuple) do
-                table.insert(req, tofield(v))
-        end
-        return dispatch(13, table.concat(req))
+local _dispatch = _dispatch
+--- jit.off(_dispatch) not needed, because C API calls are NYI
+for _, v in pairs{'add', 'replace', 'delete', 'update'} do
+    local pack = box_op.pack[v]
+    _M[v] = function (...) return object(_dispatch(pack(...))) end
 end
-
-function delete(n, key)
-        local key_len = 1
-        local req = {}
-
-        table.insert(req, tou32(n))
-        table.insert(req, tou32(key_len))
-        table.insert(req, tofield(key))
-        dispatch(20, table.concat(req))
-end
-
-function update(n, key, ...)
-        local ops = {...}
-        local flags, key_cardinality = 0, 1
-        local req = {}
-
-        table.insert(req, tou32(n))
-        table.insert(req, tou32(flags))
-        table.insert(req, tou32(key_cardinality))
-        table.insert(req, tofield(key))
-        table.insert(req, tou32(#ops))
-        for k, op in ipairs(ops) do
-                table.insert(req, tou32(op[1]))
-                if (op[2] == "set") then
-                        table.insert(req, "\000")
-                        table.insert(req, tofield(op[3]))
-                elseif (op[2] == "add") then
-                        table.insert(req, "\001\004")
-                        table.insert(req, tou32(op[3]))
-                elseif (op[2] == "and") then
-                        table.insert(req, "\002\004")
-                        table.insert(req, tou32(op[3]))
-                elseif (op[2] == "or") then
-                        table.insert(req, "\003\004")
-                        table.insert(req, tou32(op[3]))
-                elseif (op[2] == "xor") then
-                        table.insert(req, "\004\004")
-                        table.insert(req, tou32(op[3]))
-                elseif (op[2] == "splice") then
-                        table.insert(req, "\005")
-                        local s = {}
-                        if (op[3] ~= nil) then
-                                table.insert(s, "\004")
-                                table.insert(s, tou32(op[3]))
-                        else
-                                table.insert(s, "\000")
-                        end
-                        if (op[4] ~= nil) then
-                                table.insert(s, "\004")
-                                table.insert(s, tou32(op[4]))
-                        else
-                                table.insert(s, "\000")
-                        end
-                        table.insert(s, tofield(op[5]))
-                        table.insert(req, tofield(table.concat(s)))
-                elseif (op[2] == "delete") then
-                        table.insert(req, "\006\000")
-                elseif (op[2] == "insert") then
-                        table.insert(req, "\007")
-                        table.insert(req, tofield(op[3]))
-                end
-        end
-        return dispatch(19, table.concat(req))
-end
-
-ffi.cdef[[
-struct box_tuple {
-	uint32_t bsize;
-	uint32_t cardinality;
-	uint8_t data[0];
-} __attribute__((packed));
-]]
-
-
-ffi.cdef [[void object_incr_ref(struct tnt_object *obj);]]
-local tnt_object_ref = ffi.typeof("struct tnt_object **") -- userdata holding pointer to tnt_obj, hence double ptr
-local tuple_t = ffi.typeof("struct box_tuple *")
-
 
 function ctuple(obj)
    assert(obj ~= nil)
-   obj = tnt_object_ref(obj)[0]
-   assert(obj.type == 1)
-   return ffi.cast(tuple_t, obj.data)
+   return obj
+end
+local tuple_mt = {}
+function tuple(...)
+    return setmetatable({...}, tuple_mt)
 end
 
 
+local wrapped = setmetatable({}, {__mode = "k"})
 function wrap(proc_body)
-        if type(proc_body) == "string" then
-                proc_body = loadstring(code)
-        end
         if type(proc_body) ~= "function" then
                 return nil
         end
+        wrapped[proc_body] = true
 
-	local function append(out, request, ret_code, result)
-	   local header = out:add_iov_iproto_header(request)
-	   local bytes = out:bytes()
-
-	   if type(result) == "table" then
-	      out:add_iov_string(tou32(#result))
-
-	      for k, v in pairs(result) do
-		 if type(v) == "string" then
-		    out:add_iov_string(v)
-		 elseif type(v) == "userdata" then
-		    local obj = tnt_object_ref(v)[0]
-		    local tuple = ffi.cast(tuple_t, obj.data)
-		    ffi.C.object_incr_ref(obj)
-		    out:add_iov_ref(obj.data, tuple.bsize + 8, ffi.cast('uintptr_t', obj))
-		 else
-		    error("unexpected type of result: " .. type(v))
-		 end
-	      end
-	   elseif type(result) == "number" then
-	      out:add_iov_string(tou32(result))
-	   else
-	      error("unexpected type of result: " .. type(result))
-	   end
-
-	   header.data_len = header.data_len + out:bytes() - bytes
-	   header.ret_code = ret_code
-	end
-
-        local function proc(out, request, ...)
-	   -- proc_body may fail and may block in core
-	   -- it's unsafe to modify 'struct conn' while blocking in core,
-	   -- because of possible concurent updates
-	   -- so, append to conn in atomically via out:pcall
-
-	   local ret_code, result = proc_body(...)
-	   local out = net.conn(out)
-	   out:pcall(append, request, ret_code, result)
-        end
-
-        return proc
+        return proc_body
 end
 
-function tuple(...)
-        local f, bsize = {...}, 0
-        for k, v in ipairs(f) do
-                f[k] = string.tofield(v)
-                bsize = bsize + #f[k]
-        end
-        table.insert(f, 1, string.tou32(#f))
-        table.insert(f, 1, string.tou32(bsize))
-        return table.concat(f)
+local u32ptr = ffi.typeof('uint32_t *')
+local uintptr = ffi.typeof('uintptr_t')
+local u32buf = ffi.new('uint32_t[1]')
+local p = packer()
+
+local function append(result, out)
+   local out = net._conn(out)
+   p:reset()
+
+   if type(result) == "table" then
+       u32buf[0] = #result
+       out:add_iov_dup(u32buf, 4)
+
+      for _, v in ipairs(result) do
+         if type(v) == "string" then
+            out:add_iov_string(v)
+         elseif type(v) == "table" and v.__obj then
+            ffi.C.object_incr_ref(v.__obj)
+            out:add_iov_ref(v.__tuple, v.bsize + 8, ffi.cast(uintptr, v.__obj))
+         elseif type(v) == "table" and getmetatable(v) == tuple_mt then
+             p:string("....----") -- placeholder for bsize, cardinality
+             for i = 1, #v do
+                 p:field(v[i])
+             end
+             local u32 = ffi.cast(u32ptr, p.ptr)
+             u32[0] = p:len() - 8 -- bsize adjust
+             u32[1] = #v
+             out:add_iov_dup(p:pack())
+         else
+            error("unexpected type of result: " .. type(v), 2)
+         end
+      end
+   elseif type(result) == "number" then
+      out:add_iov_string(string.tou32(result))
+   else
+      error("unexpected type of result: " .. type(result), 2)
+   end
+end
+
+local fn_cache_mt = {__index = function(t, name)
+    local fn = _G
+    for k in name:gmatch('[^%.]+') do
+       fn = fn[k]
+       if not fn then
+           error("function '"..name.."' not found")
+       end
+    end
+    if type(fn) ~= 'function' then
+       error("'"..name.."' is not a function")
+    end
+    t[name] = fn
+    return fn
+end}
+local fn_cache = setmetatable({}, fn_cache_mt)
+local function clear_cache()
+    while true do
+        fiber.sleep(1)
+        fn_cache = setmetatable({}, fn_cache_mt)
+    end
+end
+fiber.create(clear_cache)
+
+function entry(name, out, request, ...)
+    add_stat_exec_lua(name)
+
+    local proc = fn_cache[name]
+    if wrapped[proc] then
+        local rcode, res = proc(...)
+        add_stat_exec_lua_rcode(name, rcode)
+        return append, rcode, res
+    end
+    add_stat_exec_lua("NotWrapped")
+    add_stat_exec_lua(name..":NotWrapped")
+    proc(out, request, ...)
+    add_stat_exec_lua_ok(name)
 end
 
 
-
-function decode_varint32(ptr, offt)
-        local initial_offt = offt
-        local result = 0
-        local byte
-        
-        byte = ptr[offt]
-        offt = offt + 1
-        result = bit.band(byte, 0x7f)
-        if bit.band(byte, 0x80) ~= 0 then
-                byte = ptr[offt]
-                offt = offt + 1
-                result = bit.bor(bit.lshift(result, 7),
-                                 bit.band(byte, 0x7f))
-                if bit.band(byte, 0x80) ~= 0 then
-                        byte = ptr[offt]
-                        offt = offt + 1
-                        result = bit.bor(bit.lshift(result, 7),
-                                         bit.band(byte, 0x7f))
-                        if bit.band(byte, 0x80) ~= 0 then
-                                byte = ptr[offt]
-                                offt = offt + 1
-                                result = bit.bor(bit.lshift(result, 7),
-                                                 bit.band(byte, 0x7f))
-                                if bit.band(byte, 0x80) ~= 0 then
-                                        byte = ptr[offt]
-                                        offt = offt + 1
-                                        result = bit.bor(bit.lshift(result, 7),
-                                                         bit.band(byte, 0x7f))
-                                end
-                        end
-                end
-        end
-
-        return result, offt
-end
+local charbuf = ffi.typeof('char *')
+function decode_varint32(ptr, offt) return varint32.read(ffi.cast(charbuf, ptr) + offt) end
 
 decode = {}
-
-function decode.varint32(obj, offt)
-        local tuple = ctuple(obj)
-        if (offt < 0 or offt + 1 > tuple.bsize) then
-                error(string.format("out of bounds: offt:%i bsize:%i\n%s", offt, tuple.bsize, debug.traceback()))
-        end
-        local result, offt = decode_varint32(tuple.data, offt)
-        if (offt > tuple.bsize) then
-                error("out of bounds\n" .. debug.traceback())
-        end
-        return result, offt
-end
-
-function decode.string(obj, offt, len)
-        local tuple = ctuple(obj)
-        if (offt < 0 or offt + len > tuple.bsize) then
-                error(string.format("out of bounds: offt:%i bsize:%i\n%s", offt, tuple.bsize, debug.traceback()))
-        end
-        return ffi.string(tuple.data + offt, len)
-end
-
-local u8_ptr, u16_ptr, u32_ptr = ffi.typeof("uint8_t *"), ffi.typeof("uint16_t *"), ffi.typeof("uint32_t *")
-
-function decode.u8(obj, offt)
-        local tuple = ctuple(obj)
-        if (offt < 0 or offt + 1 > tuple.bsize) then
-                error(string.format("out of bounds: len:1 offt:%i bsize:%i\n%s", offt, tuple.bsize, debug.traceback()))
-        end
-        return ffi.cast(u8_ptr , tuple.data + offt)[0]
-end
-
-function decode.u16(obj, offt)
-        local tuple = ctuple(obj)
-        if (offt < 0 or offt + 2 > tuple.bsize) then
-                error(string.format("out of bounds: len:2 offt:%i bsize:%i\n%s", offt, tuple.bsize, debug.traceback()))
-        end
-        return ffi.cast(u16_ptr , tuple.data + offt)[0]
-end
-
-function decode.u32(obj, offt)
-        local tuple = ctuple(obj)
-        if (offt < 0 or offt + 4 > tuple.bsize) then
-                error(string.format("out of bounds: len:4 offt:%i bsize:%i\n%s", offt, tuple.bsize, debug.traceback()))
-        end
-        return ffi.cast(u32_ptr , tuple.data + offt)[0]
-end
+function decode.varint32(obj, offt) return obj:datacast('varint32', offt) end
+function decode.string(obj, offt, len) return obj:datacast('string', offt, len) end
+function decode.u8(obj, offt) return obj:datacast('uint8_t', offt) end
+function decode.u16(obj, offt) return obj:datacast('uint16_t', offt) end
+function decode.u32(obj, offt) return obj:datacast('uint32_t', offt) end
 
 cast = {}
 function cast.u32(str)
-   if type(str) ~= 'string' then
-      error('string expected')
-   end
+   assertarg(str, 'string', 1)
    return ffi.cast('uint32_t *', str)[0]
 end

@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2010, 2011, 2012 Mail.RU
- * Copyright (C) 2010, 2011, 2012 Yuriy Vostrikov
+ * Copyright (C) 2010, 2011, 2012, 2013 Mail.RU
+ * Copyright (C) 2010, 2011, 2012, 2013 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -35,8 +35,12 @@
 - (void)
 set_nodes:(void *)nodes_ count:(size_t)count allocated:(size_t)allocated
 {
-	assert(nodes == NULL);
+	/* WARNING: set_nodes will drop any previously allocated data
+	   and reinitialize tree */
 
+	assert(node_size > 0);
+
+	free(nodes);
 	if (nodes_ == NULL) {
 		if (allocated == 0)
 			allocated = 64;
@@ -50,12 +54,10 @@ set_nodes:(void *)nodes_ count:(size_t)count allocated:(size_t)allocated
 }
 
 - (Tree *)
-init_with_unique:(bool)_unique
+init:(struct index_conf *)ic
 {
-	[super init];
-	type = TREE;
+	[super init:ic];
 	tree = xmalloc(sizeof(*tree));
-	unique = _unique;
 	return self;
 }
 
@@ -64,7 +66,22 @@ eq:(struct tnt_object *)obj_a :(struct tnt_object *)obj_b
 {
 	struct index_node *na = GET_NODE(obj_a, node_a),
 			  *nb = GET_NODE(obj_b, node_b);
-	return compare(na, nb, NULL) == 0;
+	return compare(na, nb, self->dtor_arg) == 0;
+}
+
+- (struct tnt_object *)
+find:(const char *)key
+{
+	switch (conf.field_type[0]) {
+	case NUM16: node_a.key.u16 = *(u16 *)key; break;
+	case NUM32: node_a.key.u32 = *(u32 *)key; break;
+	case NUM64: node_a.key.u64 = *(u64 *)key; break;
+	case STRING: node_a.key.ptr = key; break;
+	default: abort();
+	}
+	node_a.obj = (void *)(uintptr_t)1; /* cardinality */
+	struct index_node *r = sptree_find(tree, &node_a);
+	return r != NULL ? r->obj : NULL;
 }
 
 - (struct tnt_object *)
@@ -80,6 +97,13 @@ find_by_obj:(struct tnt_object *)obj
 {
 	dtor(obj, &node_a, dtor_arg);
 	struct index_node *r = sptree_find(tree, &node_a);
+	return r != NULL ? r->obj : NULL;
+}
+
+- (struct tnt_object *)
+find_by_node:(const struct index_node *)node
+{
+	struct index_node *r = sptree_find(tree, node);
 	return r != NULL ? r->obj : NULL;
 }
 
@@ -135,6 +159,13 @@ iterator_init_with_object:(struct tnt_object *)obj
 	sptree_iterator_init_set(tree, &iterator, &search_pattern);
 }
 
+- (void)
+iterator_init_with_node:(const struct index_node *)node
+{
+	memcpy(&search_pattern, node, node_size);
+	sptree_iterator_init_set(tree, &iterator, &search_pattern);
+}
+
 - (struct tnt_object *)
 iterator_next
 {
@@ -166,27 +197,28 @@ i32_init_pattern(struct tbuf *key, int cardinality,
 
 	u32 len;
 	switch (cardinality) {
-	case 0: pattern->u32 = INT32_MIN;
+	case 0: pattern->key.u32 = INT32_MIN;
 		break;
 	case 1: len = read_varint32(key);
 		if (len != sizeof(u32))
 			index_raise("key is not u32");
-		pattern->u32 = read_u32(key);
+		pattern->key.u32 = read_u32(key);
 		break;
 	default:
 		index_raise("cardinality too big");
 	}
 }
 
+
 - (id)
-init_with_unique:(bool)_unique
+init:(struct index_conf *)ic
 {
-	[super init_with_unique:_unique];
+	[super init:ic];
 	node_size = sizeof(struct tnt_object *) + sizeof(i32);
-	lua_ctor = luaT_i32_ctor;
 	init_pattern = i32_init_pattern;
 	pattern_compare = (index_cmp)i32_compare;
-	compare = unique ? (index_cmp)i32_compare : (index_cmp)i32_compare_with_addr;
+	compare = conf.unique ? (index_cmp)i32_compare : (index_cmp)i32_compare_with_addr;
+	[self set_nodes:NULL count:0 allocated:0];
 	return self;
 }
 @end
@@ -201,12 +233,12 @@ i64_init_pattern(struct tbuf *key, int cardinality,
 
 	u32 len;
 	switch (cardinality) {
-	case 0: pattern->u64 = INT64_MIN;
+	case 0: pattern->key.u64 = INT64_MIN;
 		break;
 	case 1: len = read_varint32(key);
 		if (len != sizeof(u64))
 			index_raise("key is not u64");
-		pattern->u64 = read_u64(key);
+		pattern->key.u64 = read_u64(key);
 		break;
 	default:
 		index_raise("cardinality too big");
@@ -214,14 +246,14 @@ i64_init_pattern(struct tbuf *key, int cardinality,
 }
 
 - (id)
-init_with_unique:(bool)_unique
+init:(struct index_conf *)ic
 {
-	[super init_with_unique:_unique];
+	[super init:ic];
 	node_size = sizeof(struct tnt_object *) + sizeof(i64);
-	lua_ctor = luaT_i64_ctor;
 	init_pattern = i64_init_pattern;
 	pattern_compare = (index_cmp)i64_compare;
-	compare = unique ? (index_cmp)i64_compare : (index_cmp)i64_compare_with_addr;
+	compare = conf.unique ? (index_cmp)i64_compare : (index_cmp)i64_compare_with_addr;
+	[self set_nodes:NULL count:0 allocated:0];
 	return self;
 }
 @end
@@ -243,18 +275,18 @@ lstr_init_pattern(struct tbuf *key, int cardinality,
 	else
 		index_raise("cardinality too big");
 
-	pattern->str = f;
+	pattern->key.ptr = f;
 }
 
 - (id)
-init_with_unique:(bool)_unique
+init:(struct index_conf *)ic
 {
-	[super init_with_unique:_unique];
+	[super init:ic];
 	node_size = sizeof(struct tnt_object *) + sizeof(void *);
-	lua_ctor = luaT_lstr_ctor;
 	init_pattern = lstr_init_pattern;
 	pattern_compare = (index_cmp)lstr_compare;
-	compare = unique ? (index_cmp)lstr_compare : (index_cmp)lstr_compare_with_addr;
+	compare = conf.unique ? (index_cmp)lstr_compare : (index_cmp)lstr_compare_with_addr;
+	[self set_nodes:NULL count:0 allocated:0];
 	return self;
 }
 @end
@@ -264,14 +296,14 @@ init_with_unique:(bool)_unique
 - (u32)
 cardinality
 {
-	struct gen_dtor *desc = dtor_arg;
-	return desc->cardinality;
+	struct index_conf *ic = dtor_arg;
+	return ic->cardinality;
 }
 
 static int
-field_compare(union field *f1, union field *f2, enum field_data_type type)
+field_compare(union index_field *f1, union index_field *f2, enum index_field_type type)
 {
-	void *d1, *d2;
+	const void *d1, *d2;
 	int r;
 
 	switch (type) {
@@ -289,12 +321,14 @@ field_compare(union field *f1, union field *f2, enum field_data_type type)
 			return r;
 
 		return f1->str.len > f2->str.len ? 1 : f1->str.len == f2->str.len ? 0 : -1;
+	case UNDEF:
+		abort();
 	}
 	abort();
 }
 
 static int
-tree_node_compare(struct tree_node *na, struct tree_node *nb, struct gen_dtor *desc)
+tree_node_compare(struct index_node *na, struct index_node *nb, struct index_conf *ic)
 {
 	/* if pattern is partialy specified compare only significant fields.
 	   it's ok to return 0 here: sptree_iterator_init_set() will select
@@ -302,13 +336,13 @@ tree_node_compare(struct tree_node *na, struct tree_node *nb, struct gen_dtor *d
 	   it is guaranteed that pattern is a first arg.
 	*/
 
-	int n = (uintptr_t)na->obj < nelem(desc->index_field) ? (uintptr_t)na->obj : desc->cardinality;
+	int n = (uintptr_t)na->obj < nelem(ic->field_index) ? (uintptr_t)na->obj : ic->cardinality;
 
 	for (int i = 0; i < n; ++i) {
-		int j = desc->cmp_order[i];
-		union field *akey = (void *)na->key + desc->offset[j];
-		union field *bkey = (void *)nb->key + desc->offset[j];
-		int r = field_compare(akey, bkey, desc->type[j]);
+		int j = ic->cmp_order[i];
+		union index_field *akey = (void *)&na->key + ic->offset[j];
+		union index_field *bkey = (void *)&nb->key + ic->offset[j];
+		int r = field_compare(akey, bkey, ic->field_type[j]);
 		if (r != 0)
 			return r;
 	}
@@ -316,13 +350,13 @@ tree_node_compare(struct tree_node *na, struct tree_node *nb, struct gen_dtor *d
 }
 
 static int
-tree_node_compare_with_addr(struct tree_node *na, struct tree_node *nb, struct gen_dtor *desc)
+tree_node_compare_with_addr(struct index_node *na, struct index_node *nb, struct index_conf *ic)
 {
-	int r = tree_node_compare(na, nb, desc);
+	int r = tree_node_compare(na, nb, ic);
 	if (r != 0)
 		return r;
 
-	if ((uintptr_t)na->obj < nelem(desc->index_field)) /* `na' is a pattern */
+	if ((uintptr_t)na->obj < nelem(ic->field_index)) /* `na' is a pattern */
 		return r;
 
 	if (na->obj > nb->obj)
@@ -334,24 +368,24 @@ tree_node_compare_with_addr(struct tree_node *na, struct tree_node *nb, struct g
 }
 
 void
-gen_set_field(union field *f, enum field_data_type type, int len, void *data)
+gen_set_field(union index_field *f, enum index_field_type type, int len, const void *data)
 {
 	switch (type) {
 	case NUM16:
 		if (len != sizeof(u16))
 			index_raise("key size mismatch, expected u16");
 		f->u16 = *(u16 *)data;
-		break;
+		return;
 	case NUM32:
 		if (len != sizeof(u32))
 			index_raise("key size mismatch, expected u32");
 		f->u32 = *(u32 *)data;
-		break;
+		return;
 	case NUM64:
 		if (len != sizeof(u64))
 			index_raise("key size mismatch, expected u64");
 		f->u64 = *(u64 *)data;
-		break;
+		return;
 	case STRING:
 		if (len > 0xffff)
 			index_raise("string key too long");
@@ -360,25 +394,28 @@ gen_set_field(union field *f, enum field_data_type type, int len, void *data)
 			memcpy(f->str.data.bytes, data, len);
 		else
 			f->str.data.ptr = data;
-		break;
+		return;
+	case UNDEF:
+		abort();
 	}
+	abort();
 }
 static void
 gen_init_pattern(struct tbuf *key_data, int cardinality, struct index_node *pattern_, void *arg)
 {
-	struct tree_node *pattern = (void *)pattern_;
-	struct gen_dtor *desc = arg;
+	struct index_node *pattern = (void *)pattern_;
+	struct index_conf *ic = arg;
 
-	if (cardinality > desc->cardinality || cardinality > nelem(desc->index_field))
+	if (cardinality > ic->cardinality || cardinality > nelem(ic->field_index))
                 index_raise("cardinality too big");
 
 	for (int i = 0; i < cardinality; i++) {
 		u32 len = read_varint32(key_data);
 		void *key = read_bytes(key_data, len);
-		int j = desc->cmp_order[i];
+		int j = ic->cmp_order[i];
 
-		union field *f = (void *)pattern->key + desc->offset[j];
-		gen_set_field(f, desc->type[j], len, key);
+		union index_field *f = (void *)&pattern->key + ic->offset[j];
+		gen_set_field(f, ic->field_type[j], len, key);
 		key += len;
 	}
 
@@ -386,22 +423,23 @@ gen_init_pattern(struct tbuf *key_data, int cardinality, struct index_node *patt
 }
 
 - (id)
-init_with_unique:(bool)_unique
+init:(struct index_conf *)ic
 {
-	[super init_with_unique:_unique];
-	struct gen_dtor *desc = dtor_arg;
+	[super init:ic];
 	node_size = sizeof(struct tnt_object *);
-	for (int i = 0; i < desc->cardinality; i++)
-		switch (desc->type[i]) {
-		case NUM16: node_size += field_sizeof(union field, u16); break;
-		case NUM32: node_size += field_sizeof(union field, u32); break;
-		case NUM64: node_size += field_sizeof(union field, u64); break;
-		case STRING: node_size += field_sizeof(union field, str); break;
+	for (int i = 0; i < ic->cardinality; i++)
+		switch (ic->field_type[i]) {
+		case NUM16: node_size += field_sizeof(union index_field, u16); break;
+		case NUM32: node_size += field_sizeof(union index_field, u32); break;
+		case NUM64: node_size += field_sizeof(union index_field, u64); break;
+		case STRING: node_size += field_sizeof(union index_field, str); break;
+		case UNDEF: abort();
 		}
 
 	init_pattern = gen_init_pattern;
 	pattern_compare = (index_cmp)tree_node_compare;
-	compare = unique ? (index_cmp)tree_node_compare : (index_cmp)tree_node_compare_with_addr;
+	compare = conf.unique ? (index_cmp)tree_node_compare : (index_cmp)tree_node_compare_with_addr;
+	[self set_nodes:NULL count:0 allocated:0];
 	return self;
 }
 @end

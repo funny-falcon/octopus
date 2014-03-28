@@ -37,7 +37,7 @@ wal_writer_inbox_size=128, ro
 # continuously fetching WAL records from shared local directory
 local_hot_standby=0, ro
 # delay in fractional seconds between successive re-readings of wal_dir
-wal_dir_rescan_delay=0.1, ro
+wal_dir_rescan_delay=5.0, ro
 
 
 # Remote hot standby (if wal_feeder_addr configured server will run in
@@ -45,6 +45,9 @@ wal_dir_rescan_delay=0.1, ro
 # setting env var SYNC_DUMP=1 will force replica do initial dump without forking.
 wal_feeder_addr=NULL, rw
 wal_feeder_filter=NULL, rw
+wal_feeder_keepalive_timeout=120.0, rw
+wal_feeder_filter_type=NULL, rw
+wal_feeder_filter_arg=NULL, rw
 
 
 ## backward compatibility mode

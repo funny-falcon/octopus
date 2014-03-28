@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2010, 2011, 2012 Mail.RU
- * Copyright (C) 2010, 2011, 2012 Yuriy Vostrikov
+ * Copyright (C) 2010, 2011, 2012, 2013, 2014 Mail.RU
+ * Copyright (C) 2010, 2011, 2012, 2013, 2014 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -40,19 +40,19 @@
 
 /* despite having type encoding tag must be unique */
 
-enum { snap_initial_tag = 1,  /* SNAP */
-       snap_tag,              /* SNAP */
-       wal_tag,               /* WAL */
-       snap_final_tag,        /* SNAP */
-       wal_final_tag,         /* WAL */
-       run_crc,               /* WAL */
-       nop,                   /* WAL */
-       snap_skip_scn,         /* SNAP */
-       paxos_prepare,         /* SYS */
-       paxos_promise,         /* SYS */
-       paxos_propose,         /* SYS */
-       paxos_accept,          /* SYS */
-       paxos_nop,             /* SYS */
+enum { snap_initial = 1,
+       snap_data,
+       wal_data,
+       snap_final,
+       wal_final,
+       run_crc,
+       nop,
+       snap_skip_scn,
+       paxos_prepare,
+       paxos_promise,
+       paxos_propose,
+       paxos_accept,
+       paxos_nop,
 
        user_tag = 32
 };
@@ -70,32 +70,18 @@ enum { snap_initial_tag = 1,  /* SNAP */
 #define TAG_WAL 0x8000
 #define TAG_SYS 0xc000
 
-static inline bool dummy_tag(int tag) /* dummy row tag */
+static inline bool scn_changer(int tag)
 {
-	return (tag & TAG_MASK) == wal_final_tag;
+	int tag_type = tag & ~TAG_MASK;
+	tag &= TAG_MASK;
+	return tag_type == TAG_WAL || tag == nop || tag == run_crc;
 }
 
-static inline u16 fix_tag(u16 tag)
+static inline bool dummy_tag(int tag) /* dummy row tag */
 {
-	switch (tag) {
-	case snap_initial_tag:	return tag | TAG_SNAP;
-	case snap_tag:		return tag | TAG_SNAP;
-	case wal_tag:		return tag | TAG_WAL;
-	case snap_final_tag:	return tag | TAG_SNAP;
-	case wal_final_tag:	return tag | TAG_WAL;
-	case run_crc:		return tag | TAG_WAL;
-	case nop:		return tag | TAG_WAL;
-	case snap_skip_scn:	return tag | TAG_SNAP;
-	case paxos_prepare:	return tag | TAG_SYS;
-	case paxos_promise:	return tag | TAG_SYS;
-	case paxos_propose:	return tag | TAG_SYS;
-	case paxos_accept:	return tag | TAG_SYS;
-	case paxos_nop:		return tag | TAG_SYS;
-	default:
-		assert(tag & ~TAG_MASK);
-		return tag;
-	}
+	return (tag & TAG_MASK) == wal_final;
 }
+
 
 extern const u64 default_cookie;
 extern const u32 default_version, version_11;
@@ -111,7 +97,6 @@ struct tbuf;
 - (u32) version;
 - (bool) eof;
 - (int) close;
-- (struct palloc_pool *) pool;
 @end
 
 @protocol XLogPullerAsync <XLogPuller>
@@ -125,6 +110,7 @@ struct tbuf;
 typedef void (follow_cb)(ev_stat *w, int events);
 
 @interface XLogDir: Object {
+	int fd;
 @public
 	size_t rows_per_file;
 	double fsync_delay;
@@ -132,8 +118,6 @@ typedef void (follow_cb)(ev_stat *w, int events);
 	const char *filetype;
 	const char *suffix;
 	const char *dirname;
-
-	XLogWriter *writer;
 };
 - (id) init_dirname:(const char *)dirname_;
 - (XLog *) open_for_read:(i64)lsn;
@@ -141,6 +125,7 @@ typedef void (follow_cb)(ev_stat *w, int events);
 - (i64) greatest_lsn;
 - (XLog *) containg_lsn:(i64)target_lsn;
 - (i64) containg_scn:(i64)target_scn;
+- (int) lock;
 @end
 
 @interface SnapDir: XLogDir
@@ -148,6 +133,13 @@ typedef void (follow_cb)(ev_stat *w, int events);
 
 @interface WALDir: XLogDir
 @end
+
+struct _row_v04 {
+	i64 lsn;
+	u16 type;
+	u32 len;
+	u8 data[];
+} __attribute__((packed));
 
 struct _row_v11 {
 	u32 header_crc32c;
@@ -170,6 +162,11 @@ struct row_v12 {
 	u8 data[0];
 } __attribute__((packed));
 
+typedef struct marker_desc {
+	u64 marker, eof;
+	off_t size, eof_size;
+} marker_desc_t;
+
 @interface XLog: Object <XLogPuller> {
 	size_t rows, wet_rows;
 	bool eof;
@@ -182,7 +179,6 @@ struct row_v12 {
 	XLogDir *dir;
 	i64 next_lsn;
 
-	struct palloc_pool *pool;
 	enum log_mode {
 		LOG_READ,
 		LOG_WRITE
@@ -200,8 +196,10 @@ struct row_v12 {
 }
 + (XLog *) open_for_read_filename:(const char *)filename
 			      dir:(XLogDir *)dir;
++ (void) register_version4: (Class)xlog;
++ (void) register_version3: (Class)xlog;
 
-- (void) follow:(follow_cb *)cb;
+- (void) follow:(follow_cb *)cb data:(void *)data;
 - (int) inprogress_rename;
 - (int) read_header;
 - (int) write_header;
@@ -209,14 +207,24 @@ struct row_v12 {
 - (void) fadvise_dont_need;
 - (size_t) rows;
 - (size_t) wet_rows_offset_available;
-- (i64) append_row:(const void *)data len:(u32)data_len scn:(i64)scn tag:(u16)tag cookie:(u64)cookie;
-- (i64) append_row:(const void *)data len:(u32)data_len scn:(i64)scn tag:(u16)tag;
-- (i64) append_row:(struct row_v12 *)row data:(const void *)data;
+- (const struct row_v12 *) append_row:(const void *)data len:(u32)data_len scn:(i64)scn
+				  tag:(u16)tag cookie:(u64)cookie;
+- (const struct row_v12 *) append_row:(const void *)data len:(u32)data_len scn:(i64)scn tag:(u16)tag;
+- (const struct row_v12 *) append_row:(struct row_v12 *)row data:(const void *)data;
 - (i64) confirm_write;
 - (void) append_successful:(size_t)bytes;
 @end
 
 struct tbuf *convert_row_v11_to_v12(struct tbuf *orig);
+void fixup_row_v12(struct row_v12 *);
+u16 fix_tag_v2(u16 tag);
+
+@interface XLog04: XLog
+@end
+
+@interface XLog03Template: XLog
+@end
+
 @interface XLog11: XLog
 @end
 
@@ -224,14 +232,6 @@ struct tbuf *convert_row_v11_to_v12(struct tbuf *orig);
 @public
 	i64 next_scn;
 }
-@end
-
-@protocol Txn
-- (void) prepare:(struct row_v12 *)row data:(const void *)data;
-- (void) commit;
-- (void) rollback;
-- (void) append:(struct wal_pack *)pack;
-- (struct row_v12 *)row;
 @end
 
 struct wal_pack {
@@ -252,23 +252,110 @@ struct wal_reply {
 	u32 run_crc;
 } __attribute__((packed));
 
+#define replication_handshake_base_fields \
+	u32 ver; \
+	i64 scn; \
+	char filter[32]
+struct replication_handshake_base {
+	replication_handshake_base_fields;
+} __attribute__((packed));
+#define REPLICATION_FILTER_NAME_LEN field_sizeof(struct replication_handshake_base, filter)
+
+#define replication_handshake_v1 replication_handshake_base
+
+struct replication_handshake_v2 {
+	replication_handshake_base_fields;
+	u32 filter_type;
+	u32 filter_arglen;
+	char filter_arg[];
+} __attribute__((packed));
+
+struct feeder_filter {
+	u32 type;
+	u32 arglen;
+	char *name;
+	void *arg;
+};
+
+struct feeder_param {
+	struct sockaddr_in addr;
+	u32 ver;
+	struct feeder_filter filter;
+};
+
+static inline bool
+feeder_param_eq(struct feeder_param *this, struct feeder_param *that)
+{
+	bool equal =
+		this->ver == that->ver &&
+		this->addr.sin_family == that->addr.sin_family &&
+		this->addr.sin_addr.s_addr == that->addr.sin_addr.s_addr &&
+		this->addr.sin_port == that->addr.sin_port &&
+		this->filter.type == that->filter.type &&
+		this->filter.arglen == that->filter.arglen;
+	if (!equal) return false;
+	bool this_name_empty = this->filter.name == NULL || strlen(this->filter.name) == 0;
+	bool that_name_empty = that->filter.name == NULL || strlen(that->filter.name) == 0;
+	equal = (this_name_empty && that_name_empty) ||
+		(!this_name_empty && !that_name_empty &&
+		 strcmp(this->filter.name, that->filter.name) == 0);
+	if (!equal) return false;
+	equal = this->filter.arglen == 0 ||
+		memcmp(this->filter.arg, that->filter.arg, this->filter.arglen) == 0;
+	return equal;
+}
+
+enum feeder_cfg_e {
+	FEEDER_CFG_OK = 0,
+	FEEDER_CFG_BAD_ADDR = 1,
+	FEEDER_CFG_BAD_FILTER = 2,
+	FEEDER_CFG_BAD_VERSION = 4,
+};
+enum feeder_cfg_e feeder_param_fill_from_cfg(struct feeder_param *param, struct octopus_cfg *cfg);
+bool feeder_param_set_addr(struct feeder_param *param, const char *addr);
+
+
+enum {
+	FILTER_TYPE_ID  = 0,
+	FILTER_TYPE_LUA = 1,
+	FILTER_TYPE_C   = 2,
+	FILTER_TYPE_MAX = 3
+};
+
 
 int wal_pack_prepare(XLogWriter *r, struct wal_pack *);
 u32 wal_pack_append_row(struct wal_pack *pack, struct row_v12 *row);
 void wal_pack_append_data(struct wal_pack *pack, struct row_v12 *row,
 			  const void *data, size_t len);
 
-@interface XLogWriter: Object {
+@protocol RecoveryState
+- (i64) lsn;
+- (i64) scn;
+- (u32) run_crc_log;
+@end
+
+@interface SnapWriter: Object {
+	id<RecoveryState> state;
+	XLogDir *snap_dir;
+}
+- (id) init_state:(id<RecoveryState>)state snap_dir:(XLogDir *)snap_dir;
+- (int) snapshot:(bool)sync;
+- (int) snapshot_write;
+- (u32) snapshot_estimate;
+- (int) snapshot_write_rows:(XLog *)snap;
+@end
+
+@interface XLogWriter: Object <RecoveryState> {
 	i64 lsn, scn, last_scn;
 	XLogDir *wal_dir, *snap_dir;
-	XLog *wal_to_close;
 	ev_timer wal_timer;
 	bool configured;
+	SnapWriter *snap_writer;
 @public
 	bool local_writes;
 	struct child *wal_writer;
 	XLog *current_wal;	/* the WAL we'r currently reading/writing from/to */
-	int snap_io_rate_limit;
+
 	u32 run_crc_log;
 	struct crc_hist { i64 scn; u32 log; } crc_hist[512]; /* should be larger than
 								cfg.wal_writer_inbox_size */
@@ -285,14 +372,10 @@ void wal_pack_append_data(struct wal_pack *pack, struct row_v12 *row,
 - (int) wal_pack_submit;
 
 /* entry points: modules should call this */
-- (int) submit:(id<Txn>)txn;
 - (int) submit:(const void *)data len:(u32)len tag:(u16)tag;
 
-- (int) snapshot:(bool)sync;
-- (int) snapshot_write;
-- (int) snapshot_initial;
-- (u32) snapshot_estimate;
-- (int) snapshot_write_rows:(XLog *)snap;
+- (SnapWriter *) snap_writer;
+- (int) write_initial_state;
 @end
 
 @interface XLogWriter (Fold)
@@ -301,20 +384,20 @@ void wal_pack_append_data(struct wal_pack *pack, struct row_v12 *row,
 
 @interface XLogPuller: Object <XLogPuller, XLogPullerAsync> {
 	struct conn c;
-	struct sockaddr_in addr;
 	u32 version;
 	bool abort;
 	struct fiber *in_recv;
+	struct feeder_param *feeder;
 }
 
 - (ssize_t) recv;
 - (void) abort_recv;
 
 - (XLogPuller *) init;
-- (XLogPuller *) init_addr:(struct sockaddr_in *)addr_;
+- (XLogPuller *) init:(struct feeder_param*)_feeder;
+- (void) feeder_param:(struct feeder_param*)_feeder;
+/* returns -1 in case of handshake failure. puller is closed.  */
 - (int) handshake:(i64)scn err:(const char **)err_ptr;
-- (int) handshake:(struct sockaddr_in *)addr_ scn:(i64)scn;
-- (int) handshake:(struct sockaddr_in *)addr_ scn:(i64)scn err:(const char **)err_ptr;
 @end
 
 @interface Recovery: XLogWriter {
@@ -323,16 +406,13 @@ void wal_pack_append_data(struct wal_pack *pack, struct row_v12 *row,
 	char status[64];
 
 	XLogPuller *remote_puller;
-	const char *feeder_addr;
+	struct feeder_param feeder;
 
 	bool run_crc_log_mismatch, run_crc_mod_mismatch;
 	u32 processed_rows, estimated_snap_rows;
 
 	i64 next_skip_scn;
 	struct tbuf skip_scn;
-
-@public
-	Class txn_class;
 }
 
 - (const char *) status;
@@ -341,7 +421,7 @@ void wal_pack_append_data(struct wal_pack *pack, struct row_v12 *row,
 - (ev_tstamp) run_crc_lag;
 - (const char *) run_crc_status;
 
-- (void) recover_row:(const struct row_v12 *)row;
+- (void) recover_row:(struct row_v12 *)row;
 - (void) verify_run_crc:(struct tbuf *)buf;
 - (void) recover_finalize;
 - (i64) recover_start;
@@ -349,16 +429,17 @@ void wal_pack_append_data(struct wal_pack *pack, struct row_v12 *row,
 - (i64) recover_snap;
 - (i64) recover_cont;
 - (void) wal_final_row;
-- (int) recover_follow_remote:(XLogPuller *)puller exit_on_eof:(int)exit_on_eof;
+/* pull_wal & load_from_remote throws exceptions on failure */
+- (int) pull_wal:(id<XLogPullerAsync>)puller;
+- (int) load_from_remote:(id<XLogPullerAsync>)puller;
+- (void) pull_from_remote:(id<XLogPullerAsync>)puller;
 - (void) enable_local_writes;
 - (bool) is_replica;
 - (void) check_replica;
 
-- (void) feeder_change_from:(const char *)old to:(const char *)new;
-
 - (int) submit_run_crc;
 
-- (const struct row_v12 *)dummy_row_lsn:(i64)lsn_ scn:(i64)scn_ tag:(u16)tag;
+- (struct row_v12 *)dummy_row_lsn:(i64)lsn_ scn:(i64)scn_ tag:(u16)tag;
 
 - (id) init_snap_dir:(const char *)snap_dir
              wal_dir:(const char *)wal_dir;
@@ -366,9 +447,15 @@ void wal_pack_append_data(struct wal_pack *pack, struct row_v12 *row,
 - (id) init_snap_dir:(const char *)snap_dir
              wal_dir:(const char *)wal_dir
         rows_per_wal:(int)rows_per_wal
-	 feeder_addr:(const char *)feeder_addr
-               flags:(int)flags
-	   txn_class:(Class)txn_class;
+	feeder_param:(struct feeder_param*)feeder_
+               flags:(int)flags;
+
+- (struct sockaddr_in) feeder_addr;
+- (bool) feeder_addr_configured;
+- (bool) feeder_changed:(struct feeder_param*)new;
+
+- (void) status_update:(const char *)fmt, ...;
+- (void) status_changed;
 @end
 
 @interface Recovery (Deprecated)
@@ -388,11 +475,12 @@ int wal_disk_writer(int fd, void *state);
 void wal_disk_writer_input_dispatch(va_list ap __attribute__((unused)));
 int snapshot_write_row(XLog *l, u16 tag, struct tbuf *row);
 
-struct replication_handshake {
-		u32 ver;
-		i64 scn;
-		char filter[32];
-} __attribute__((packed));
+void remote_hot_standby(va_list ap);
+
+static inline struct _row_v04 *_row_v04(const struct tbuf *t)
+{
+	return (struct _row_v04 *)t->ptr;
+}
 
 static inline struct _row_v11 *_row_v11(const struct tbuf *t)
 {

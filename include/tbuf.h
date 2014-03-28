@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2010, 2011 Mail.RU
- * Copyright (C) 2010, 2011 Yuriy Vostrikov
+ * Copyright (C) 2010, 2011, 2012, 2013 Mail.RU
+ * Copyright (C) 2010, 2011, 2012, 2013 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -37,7 +37,7 @@
 
 struct tbuf {
 	void *ptr, *end;
-	u32 free;
+	uint32_t free;
 	struct palloc_pool *pool;
 };
 
@@ -67,16 +67,18 @@ static inline int __attribute__((pure)) tbuf_free(const struct tbuf *b)
 }
 
 struct tbuf *tbuf_alloc(struct palloc_pool *pool);
-
-void __attribute__((regparm(2)))
-tbuf_ensure_resize(struct tbuf *e, size_t bytes_required);
+void tbuf_ensure_resize(struct tbuf *e, size_t bytes_required);
 static __attribute__((always_inline)) inline void
 tbuf_ensure(struct tbuf *e, size_t required)
 {
+#ifdef TBUF_PARANOIA
 	assert(tbuf_len(e) <= tbuf_size(e));
+#endif
 	if (unlikely(tbuf_free(e) < required))
 		tbuf_ensure_resize(e, required);
 }
+
+void tbuf_willneed(struct tbuf *e, size_t required);
 
 struct tbuf *tbuf_clone(struct palloc_pool *pool, const struct tbuf *orig);
 void tbuf_gc(struct palloc_pool *pool, void *ptr);
@@ -88,6 +90,7 @@ void tbuf_ltrim(struct tbuf *b, size_t diff);
 void tbuf_rtrim(struct tbuf *b, size_t diff);
 
 void tbuf_append(struct tbuf *b, const void *data, size_t len);
+#define tbuf_add_dup(b, data) tbuf_append(b, (data), sizeof(*(data)))
 void tbuf_append_field(struct tbuf *b, void *f);
 void tbuf_vprintf(struct tbuf *b, const char *format, va_list ap)
 	__attribute__ ((format(FORMAT_PRINTF, 2, 0)));

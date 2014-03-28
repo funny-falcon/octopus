@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2011, 2012 Mail.RU
- * Copyright (C) 2011, 2012 Yuriy Vostrikov
+ * Copyright (C) 2011, 2012, 2013, 2014 Mail.RU
+ * Copyright (C) 2011, 2012, 2013, 2014 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -30,6 +30,7 @@
 #import <fiber.h>
 #import <util.h>
 #import <say.h>
+#import <objc.h>
 
 #include <third_party/queue.h>
 
@@ -81,14 +82,19 @@ netmsg_unref(struct netmsg *m, int from)
 
 		if (m->ref[i] & 1)
 			have_lua_refs = 1;
-		else
+		else {
+#ifdef OCT_OBJECT
 			object_decr_ref((struct tnt_object *)m->ref[i]);
+#else
+			abort();
+#endif
+		}
 	}
 
 	if (have_lua_refs) {
 		lua_State *L = fiber->L;
 		lua_getglobal(L, "__netmsg_unref");
-		lua_pushlightuserdata(L, m);
+		luaT_pushptr(L, m);
 		lua_pushinteger(L, from);
 		lua_call(L, 2, 0);
 	}
@@ -152,7 +158,7 @@ netmsg_concat(struct netmsg_head *dst, struct netmsg_head *src)
 }
 
 void
-netmsg_rewind(struct netmsg_head *h, struct netmsg_mark *mark)
+netmsg_rewind(struct netmsg_head *h, const struct netmsg_mark *mark)
 {
 	struct netmsg *m, *tvar;
 	TAILQ_FOREACH_SAFE(m, &h->q, link, tvar) {
@@ -217,6 +223,7 @@ net_add_iov_dup(struct netmsg_head *h, const void *buf, size_t len)
 	net_add_iov(h, copy, len);
 }
 
+#ifdef OCT_OBJECT
 void
 net_add_ref_iov(struct netmsg_head *h, uintptr_t obj, const void *buf, size_t len)
 {
@@ -239,7 +246,7 @@ net_add_obj_iov(struct netmsg_head *o, struct tnt_object *obj, const void *buf, 
 	object_incr_ref(obj);
 	net_add_ref_iov(o, (uintptr_t)obj, buf, len);
 }
-
+#endif
 
 void
 netmsg_verify_ownership(struct netmsg_head *h)
@@ -497,6 +504,9 @@ conn_free(struct conn *c)
 
 	switch (c->memory_ownership & MO_CONN_OWNERSHIP_MASK) {
 		case MO_STATIC:
+			/* restore state for possible later use */
+			netmsg_head_init(&c->out_messages, c->pool);
+			netmsg_alloc(&c->out_messages);
 			break;
 		case MO_MALLOC:
 			free(c);
@@ -863,28 +873,28 @@ retry_bind:
 void
 tcp_server(va_list ap)
 {
-	const char *addr = va_arg(ap, const char *);
-	void (*handler)(int fd, void *data) = va_arg(ap, void (*)(int, void *));
-	void (*on_bind)(int fd) = va_arg(ap, void (*)(int fd));
-	void *data = va_arg(ap, void *);
+	struct tcp_server_state state;
+	state.addr = va_arg(ap, const char *);
+	state.handler = va_arg(ap, void (*)(int, void *, struct tcp_server_state *));
+	state.on_bind = va_arg(ap, void (*)(int fd));
+	state.data = va_arg(ap, void *);
 
-	struct sockaddr_in saddr;
 	int cfd, fd, one = 1;
 
-	if (!addr)
+	if (!state.addr)
 		return; /* exit before yield() will prevent fiber creation */
 
-	if (atosin(addr, &saddr) < 0)
+	if (atosin(state.addr, &state.saddr) < 0)
 		return;
 
-	if ((fd = server_socket(SOCK_STREAM, &saddr, 1, on_bind, fiber_sleep)) < 0)
+	if ((fd = server_socket(SOCK_STREAM, &state.saddr, 1, state.on_bind, fiber_sleep)) < 0)
 		return;
 
-	ev_io io = { .coro = 1 };
-	ev_io_init(&io, (void *)fiber, fd, EV_READ);
+	state.io = (ev_io){ .coro = 1 };
+	ev_io_init(&state.io, (void *)fiber, fd, EV_READ);
 
-	ev_io_start(&io);
-	while (1) {
+	ev_io_start(&state.io);
+	while (ev_is_active(&state.io)) {
 		yield();
 
 		while ((cfd = accept(fd, NULL, NULL)) > 0) {
@@ -899,14 +909,23 @@ tcp_server(va_list ap)
 				/* Do nothing, not a fatal error.  */
 			}
 
-			handler(cfd, data);
+			state.handler(cfd, state.data, &state);
+			if (!ev_is_active(&state.io)) {
+				return;
+			}
+		}
+
+		if (errno == EINVAL || errno == EBADF || errno == ENOTSOCK) {
+			say_debug("tcp_socket acceptor were closed on : %s", state.addr);
+			ev_io_stop(&state.io);
+			break;
 		}
 
 		if (errno == EMFILE) {
 			say_error("can't accept, too many open files, throttling");
-			ev_io_stop(&io);
+			ev_io_stop(&state.io);
 			fiber_sleep(0.5);
-			ev_io_start(&io);
+			ev_io_start(&state.io);
 			continue;
 		}
 		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
@@ -915,6 +934,13 @@ tcp_server(va_list ap)
 		say_syserror("accept");
 		fiber_sleep(1);
 	}
+}
+
+void
+tcp_server_stop(struct tcp_server_state *state)
+{
+	ev_io_stop(&state->io);
+	close(state->io.fd);
 }
 
 void
@@ -976,7 +1002,7 @@ loop:
 		/* trigger processing of data.
 		   c->service->processing will be traversed by wakeup_workers() */
 		if (c->processing_link.tqe_prev == NULL)
-			TAILQ_INSERT_HEAD(&c->service->processing, c, processing_link);
+			TAILQ_INSERT_TAIL(&c->service->processing, c, processing_link);
 	} else if (r == 0) {
 		say_debug("%s client closed connection", c->service->name);
 		conn_close(c);
@@ -1029,6 +1055,18 @@ accept_client(int fd, void *data)
 	clnt->state = CONNECTED;
 }
 
+static inline void
+service_alloc_handlers(struct service *s, int capa)
+{
+	int i;
+	s->ih_size = 0;
+	s->ih = xcalloc(capa, sizeof(struct iproto_handler));
+	s->ih_mask = capa - 1;
+	for(i = 0; i < capa; i++) {
+		s->ih[i].code = -1;
+	}
+}
+
 void
 tcp_service(struct service *service, const char *addr, void (*on_bind)(int fd), void (*wakeup_workers)(ev_prepare *))
 {
@@ -1039,7 +1077,7 @@ tcp_service(struct service *service, const char *addr, void (*on_bind)(int fd), 
 	TAILQ_INIT(&service->processing);
 	service->pool = palloc_create_pool(name);
 	service->name = name;
-	service->batch = 64;
+	service->batch = 32;
 
 	palloc_register_gc_root(service->pool, service, service_gc);
 
@@ -1051,6 +1089,37 @@ tcp_service(struct service *service, const char *addr, void (*on_bind)(int fd), 
 
 	ev_prepare_init(&service->wakeup, (void *)wakeup_workers);
 	ev_prepare_start(&service->wakeup);
+
+	service_alloc_handlers(service, SERVICE_DEFAULT_CAPA);
+}
+
+void
+service_set_handler(struct service *s, struct iproto_handler h)
+{
+	if (h.code == -1) {
+		free(s->ih);
+		service_alloc_handlers(s, SERVICE_DEFAULT_CAPA);
+		s->default_handler = h;
+		return;
+	}
+	if (s->ih_size > s->ih_mask / 3) {
+		struct iproto_handler *old_ih = s->ih;
+		int i, old_n = s->ih_mask + 1;
+		service_alloc_handlers(s, old_n * 2);
+		for(i = 0; i < old_n; i++) {
+			if (old_ih[i].code != -1) {
+				service_set_handler(s, old_ih[i]);
+			}
+		}
+		free(old_ih);
+	}
+	int pos = h.code & s->ih_mask;
+	int dlt = (h.code % s->ih_mask) | 1;
+	while(s->ih[pos].code != h.code && s->ih[pos].code != -1)
+		pos = (pos + dlt) & s->ih_mask;
+	if (s->ih[pos].code != h.code)
+		s->ih_size++;
+	s->ih[pos] = h;
 }
 
 void
@@ -1079,7 +1148,17 @@ int
 atosin(const char *orig, struct sockaddr_in *addr)
 {
 	int port;
-	char *str = strdupa(orig);
+	addr->sin_family = AF_UNSPEC;
+
+	if (orig == NULL || *orig == 0) {
+		addr->sin_addr.s_addr = INADDR_ANY;
+		return -1;
+	}
+
+	char str[25];
+	strncpy(str, orig, 25);
+	str[24] = 0;
+
 	char *colon = strchr(str, ':');
 
 	if (colon != NULL) {
@@ -1095,7 +1174,6 @@ atosin(const char *orig, struct sockaddr_in *addr)
 	}
 
 	memset(addr, 0, sizeof(*addr));
-	addr->sin_family = AF_INET;
 
 	if (colon == NULL || colon == str) { /* "33013" ":33013" */
 		addr->sin_addr.s_addr = INADDR_ANY;
@@ -1106,6 +1184,7 @@ atosin(const char *orig, struct sockaddr_in *addr)
 		}
 	}
 
+	addr->sin_family = AF_INET;
 	addr->sin_port = htons(port);
 	return 0;
 }
@@ -1169,6 +1248,60 @@ net_fixup_addr(char **addr, int port)
 	}
 
 	return 0;
+}
+
+static void
+cat(char *dst, size_t n, const char *prefix, const char *src)
+{
+	if (!src || strlen(src) == 0 || n - strlen(dst) < strlen(src) + strlen(prefix))
+		return;
+
+	strcat(dst, prefix);
+	strcat(dst, src);
+}
+
+void
+title(const char *fmt, ...)
+{
+	/* title expects ..  */
+	extern id recovery;
+	char buf[128] = { 0 };
+
+	if (current_module && current_module->name)
+		cat(buf, sizeof(buf), "", current_module->name);
+	else if (fiber->name)
+		cat(buf, sizeof(buf), "", fiber->name);
+	else if (module(NULL) && module(NULL)->name)
+		cat(buf, sizeof(buf), "", module(NULL)->name);
+	else
+		cat(buf, sizeof(buf), "", "unknown");
+
+	if (fmt) {
+		va_list ap;
+		char tmp[32];
+		va_start(ap, fmt);
+		vsnprintf(tmp, sizeof(tmp), fmt, ap);
+		va_end(ap);
+		cat(buf, sizeof(buf), ":", tmp);
+	} else {
+		@try {
+			void *status = [recovery perform:@selector(status)];
+			cat(buf, sizeof(buf), ":", status);
+		}
+		@catch (id e) {
+			/* oops, bad object */
+		}
+	}
+
+	cat(buf, sizeof(buf), "@", cfg.custom_proc_title);
+
+	/* if recovery is present then we're called from main proccess serving request */
+	if (recovery) {
+		cat(buf, sizeof(buf), " pri:", cfg.primary_addr);
+		cat(buf, sizeof(buf), " sec:", cfg.secondary_addr);
+		cat(buf, sizeof(buf), " adm:", cfg.admin_addr);
+	}
+	set_proc_title("%s", buf);
 }
 
 static void __attribute__((constructor))

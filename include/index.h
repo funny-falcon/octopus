@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2010, 2011, 2012 Mail.RU
- * Copyright (C) 2010, 2011, 2012 Yuriy Vostrikov
+ * Copyright (C) 2010, 2011, 2012, 2013 Mail.RU
+ * Copyright (C) 2010, 2011, 2012, 2013 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -28,63 +28,68 @@
 #define INDEX_H
 
 #include <util.h>
+#include <pickle.h>
 #include <objc.h>
 
 #include <stdbool.h>
+#include <string.h>
 
 
-struct tnt_object;
-struct index_node {
-	struct tnt_object *obj;
-	union {
-		char key[0];
-		u32 u32;
-		u64 u64;
-		void *str;
-	};
-};
-
-union field {
+union index_field {
 	u16 u16;
 	u32 u32;
 	u64 u64;
+	const void *ptr;
+	char chr[0]; /* for LuaJIT casts */
 	struct {
 		i16 len;
 		union {
 			u8 bytes[sizeof(u64)];
-			void *ptr;
+			const void *ptr;
 		} data;
 	} str __attribute__((packed));
 };
 
-enum field_data_type { NUM16, NUM32, NUM64, STRING };
-struct gen_dtor {
-	int min_tuple_cardinality;
-	int index_field[8];
+struct index_node {
+	struct tnt_object *obj;
+	union index_field key;
+};
+
+
+struct index_conf {
+	int field_index[8];
 	int cmp_order[8];
 	int offset[8];
-	int cardinality;
-	enum field_data_type type[8];
+	enum index_field_type { UNDEF, NUM16, NUM32, NUM64, STRING } field_type[8];
+	int min_tuple_cardinality, cardinality;
+	enum index_type { HASH, TREE } type;
+	bool unique;
+	int n;
 };
-
-struct tree_node {
-	struct tnt_object *obj;
-	unsigned char key[];
-};
-
-union {
-	struct index_node index;
-	struct tree_node tree;
-} index_nodes;
 
 typedef struct index_node *(index_dtor)(struct tnt_object *obj, struct index_node *node, void *arg);
 struct lua_State;
-typedef struct tbuf *(index_lua_ctor)(struct lua_State *L, int i);
 typedef int (*index_cmp)(const void *, const void *, void *);
+
+struct dtor_conf {
+	index_dtor *u32, *u64, *lstr, *generic;
+};
+
+/* Following selectors used by LuaJIT bindings and MUST NOT throw exceptions:
+   find:
+   find_by_node:
+   get:
+   iterator_init
+   iterator_init_with_node:
+   iterator_init_with_object:
+   iterator_next
+*/
 
 @protocol BasicIndex
 - (int)eq:(struct tnt_object *)a :(struct tnt_object *)b;
+- (struct tnt_object *)find:(const char *)key;
 - (struct tnt_object *)find_by_obj:(struct tnt_object *)obj;
+- (struct tnt_object *)find_by_node:(const struct index_node *)obj;
 - (struct tnt_object *) find_key:(struct tbuf *)key_data with_cardinalty:(u32)key_cardinality;
 - (int) remove: (struct tnt_object *)obj;
 - (void) replace: (struct tnt_object *)obj;
@@ -93,6 +98,7 @@ typedef int (*index_cmp)(const void *, const void *, void *);
 - (void)iterator_init;
 - (void)iterator_init:(struct tbuf *)key_data with_cardinalty:(u32)cardinality;
 - (void)iterator_init_with_object:(struct tnt_object *)obj;
+- (void)iterator_init_with_node:(const struct index_node *)node;
 - (struct tnt_object *)iterator_next;
 - (u32)size;
 - (u32)slots;
@@ -103,14 +109,11 @@ typedef int (*index_cmp)(const void *, const void *, void *);
 #define GET_NODE(obj, node) ({ dtor(obj, &node, dtor_arg); &node; })
 @interface Index: Object {
 @public
-	unsigned n;
-	bool unique;
-	enum { HASH, TREE } type;
+	struct index_conf conf;
 
 	size_t node_size;
 	index_dtor *dtor;
 	void *dtor_arg;
-	index_lua_ctor *lua_ctor;
 
 	int (*compare)(const void *a, const void *b, void *);
 	int (*pattern_compare)(const void *a, const void *b, void *);
@@ -121,6 +124,8 @@ typedef int (*index_cmp)(const void *, const void *, void *);
 	char __padding_b[512];
 }
 
++ (Index *)new_conf:(struct index_conf *)ic dtor:(const struct dtor_conf *)dc;
+- (Index *)init:(struct index_conf *)ic;
 - (void) valid_object:(struct tnt_object*)obj;
 - (u32)cardinality;
 @end
@@ -134,15 +139,9 @@ typedef int (*index_cmp)(const void *, const void *, void *);
 - (id) unwrap;
 @end
 
-@interface Index (Tuple)
-+ (Index *)new_with_n:(int)n_
-		  cfg:(struct octopus_cfg_object_space_index *)cfg;
-@end
-
 @protocol HashIndex <BasicIndex>
 - (void) resize:(u32)buckets;
 - (struct tnt_object *) get:(u32)i;
-- (struct tnt_object *) find:(void *)key;
 - (void) ordered_iterator_init; /* WARNING! after this the index become corrupt! */
 @end
 
@@ -174,7 +173,6 @@ typedef int (*index_cmp)(const void *, const void *, void *);
 	struct index_node search_pattern;
 	char __tree_padding[256]; /* FIXME: overflow */
 }
-- (Tree *)init_with_unique:(bool)_unque;
 - (void)set_nodes:(void *)nodes_ count:(size_t)count allocated:(size_t)allocated;
 
 - (struct tnt_object *)iterator_next_verify_pattern;
@@ -190,7 +188,7 @@ typedef int (*index_cmp)(const void *, const void *, void *);
 
 @interface GenTree: Tree
 @end
-void gen_set_field(union field *f, enum field_data_type type, int len, void *data);
+void gen_set_field(union index_field *f, enum index_field_type type, int len, const void *data);
 
 #define foreach_index(ivar, obj_space)					\
 	for (Index<BasicIndex>						\
@@ -203,25 +201,32 @@ void gen_set_field(union field *f, enum field_data_type type, int len, void *dat
 @end
 
 
-int luaT_indexinit(struct lua_State *L);
-void luaT_pushindex(struct lua_State *L, Index *index);
-struct tbuf *luaT_i32_ctor(struct lua_State *L, int i);
-struct tbuf *luaT_i64_ctor(struct lua_State *L, int i);
-struct tbuf *luaT_lstr_ctor(struct lua_State *L, int i);
-struct tbuf *luaT_cstr_ctor(struct lua_State *L, int i);
-
 void index_raise_(const char *file, int line, const char *msg)
 	__attribute__((noreturn)) oct_cold;
 #define index_raise(msg) index_raise_(__FILE__, __LINE__, (msg))
 
 
-int i32_compare(struct index_node *na, struct index_node *nb, void *x __attribute__((unused)));
-int i32_compare_with_addr(struct index_node *na, struct index_node *nb, void *x __attribute__((unused)));
-int i64_compare(struct index_node *na, struct index_node *nb, void *x __attribute__((unused)));
-int i64_compare_with_addr(struct index_node *na, struct index_node *nb, void *x __attribute__((unused)));
-int lstr_compare(struct index_node *na, struct index_node *nb, void *x __attribute__((unused)));
-int lstr_compare_with_addr(struct index_node *na, struct index_node *nb, void *x __attribute__((unused)));
-int cstr_compare(struct index_node *na, struct index_node *nb, void *x __attribute__((unused)));
-int cstr_compare_with_addr(struct index_node *na, struct index_node *nb, void *x __attribute__((unused)));
+int i32_compare(const struct index_node *na, const struct index_node *nb, void *x __attribute__((unused)));
+int i32_compare_with_addr(const struct index_node *na, const struct index_node *nb, void *x __attribute__((unused)));
+int i64_compare(const struct index_node *na, const struct index_node *nb, void *x __attribute__((unused)));
+int i64_compare_with_addr(const struct index_node *na, const struct index_node *nb, void *x __attribute__((unused)));
+int lstr_compare(const struct index_node *na, const struct index_node *nb, void *x __attribute__((unused)));
+int lstr_compare_with_addr(const struct index_node *na, const struct index_node *nb, void *x __attribute__((unused)));
+int cstr_compare(const struct index_node *na, const struct index_node *nb, void *x __attribute__((unused)));
+int cstr_compare_with_addr(const struct index_node *na, const struct index_node *nb, void *x __attribute__((unused)));
+
+
+static inline int llexstrcmp(const void *a, const void *b)
+{
+	int al, bl;
+	int r;
+
+	al = LOAD_VARINT32(a);
+	bl = LOAD_VARINT32(b);
+
+	r = memcmp(a, b, al <= bl ? al : bl);
+
+	return r != 0 ? r : al - bl;
+}
 
 #endif

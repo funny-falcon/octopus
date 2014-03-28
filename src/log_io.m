@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2010, 2011, 2012 Mail.RU
- * Copyright (C) 2010, 2011, 2012 Yuriy Vostrikov
+ * Copyright (C) 2010, 2011, 2012, 2013, 2014 Mail.RU
+ * Copyright (C) 2010, 2011, 2012, 2013, 2014 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -41,6 +41,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/file.h>
 
 #if !HAVE_DECL_FDATASYNC
 extern int fdatasync(int fd);
@@ -69,65 +70,84 @@ const u32 default_version = 12;
 const u32 version_11 = 11;
 const char *v11 = "0.11\n";
 const char *v12 = "0.12\n";
+const char *v04 = "0.04\n";
+const char *v03 = "0.03\n";
 const char *snap_mark = "SNAP\n";
 const char *xlog_mark = "XLOG\n";
 const char *inprogress_suffix = ".inprogress";
 const u32 marker = 0xba0babed;
 const u32 eof_marker = 0x10adab1e;
+Class version3 = nil;
+Class version4 = nil;
+
 
 const char *
 xlog_tag_to_a(u16 tag)
 {
 	static char buf[16];
-	u16 tag_type = (tag & ~TAG_MASK) >> TAG_SIZE;
+	char *p = buf;
+	u16 tag_type = tag & ~TAG_MASK;
 	tag &= TAG_MASK;
-	switch (tag) {
-	case snap_initial_tag:	return "snap_initial_tag";
-	case snap_tag:		return "snap_tag";
-	case wal_tag:		return "wal_tag";
-	case snap_final_tag:	return "snap_final_tag";
-	case wal_final_tag:	return "wal_final_tag";
-	case run_crc:		return "run_crc";
-	case nop:		return "nop";
-	case paxos_prepare:	return "paxos_prepare";
-	case paxos_promise:	return "paxos_promise";
-	case paxos_propose:	return "paxos_propose";
-	case paxos_accept:	return "paxos_accept";
-	case snap_skip_scn:	return "snap_skip_scn";
+
+	switch (tag_type) {
+	case TAG_SNAP: p += sprintf(p, "snap/"); break;
+	case TAG_WAL: p += sprintf(p, "wal/"); break;
+	case TAG_SYS: p += sprintf(p, "sys/"); break;
+	default: p += sprintf(p, "%i/", tag_type >> TAG_SIZE);
 	}
-	if (tag < user_tag)
-		snprintf(buf, sizeof(buf), "0x%x/sys%i", tag_type, tag);
-	else
-		snprintf(buf, sizeof(buf), "0x%x/usr%i", tag_type, tag - user_tag);
+
+	switch (tag) {
+	case snap_initial:	strcat(p, "snap_initial"); break;
+	case snap_data:		strcat(p, "snap_data"); break;
+	case snap_final:	strcat(p, "snap_final"); break;
+	case wal_data:		strcat(p, "wal_data"); break;
+	case wal_final:		strcat(p, "wal_final"); break;
+	case run_crc:		strcat(p, "run_crc"); break;
+	case nop:		strcat(p, "nop"); break;
+	case paxos_prepare:	strcat(p, "paxos_prepare"); break;
+	case paxos_promise:	strcat(p, "paxos_promise"); break;
+	case paxos_propose:	strcat(p, "paxos_propose"); break;
+	case paxos_accept:	strcat(p, "paxos_accept"); break;
+	case snap_skip_scn:	strcat(p, "snap_skip_scn"); break;
+	default:
+		if (tag < user_tag)
+			sprintf(p, "sys%i", tag);
+		else
+			sprintf(p, "usr%i", tag >> 5);
+	}
 	return buf;
+}
+
+static char *
+set_file_buf(FILE *fd) {
+	char	*vbuf;
+	const int bufsize = 64 * 1024;
+
+	/* libc will try prepread sizeof(vbuf) bytes on every fseeko,
+	   so no reason to make vbuf particulary large */
+	vbuf = xmalloc(bufsize);
+	setvbuf(fd, vbuf, _IOFBF, bufsize);
+
+	return vbuf;
 }
 
 @implementation XLog
 - (bool) eof { return eof; }
 - (u32) version { return 0; }
-- (struct palloc_pool *) pool { return pool; }
 
 - (XLog *)
 init_filename:(const char *)filename_
            fd:(FILE *)fd_
           dir:(XLogDir *)dir_
+	  vbuf:(char*)vbuf_
 {
 	[super init];
 	filename = strdup(filename_);
-	pool = palloc_create_pool(filename);
 	fd = fd_;
 	mode = LOG_READ;
 	dir = dir_;
-	if (dir)
-		stat.data = dir->writer;
+	vbuf = vbuf_;
 
-#ifdef __GLIBC__
-	/* libc will try prepread sizeof(vbuf) bytes on every fseeko,
-	   so no reason to make vbuf particulary large */
-	const int bufsize = 64 * 1024;
-	vbuf = xmalloc(bufsize);
-	setvbuf(fd, vbuf, _IOFBF, bufsize);
-#endif
 	offset = ftello(fd);
 	return self;
 }
@@ -138,9 +158,11 @@ open_for_read_filename:(const char *)filename dir:(XLogDir *)dir
 	char filetype_[32], version_[32];
 	XLog *l = nil;
 	FILE *fd;
+	char *fbuf;
 
 	if ((fd = fopen(filename, "r")) == NULL)
-		return nil;
+		return nil; /* no cleanup needed */
+	fbuf = set_file_buf(fd);
 
 	if (fgets(filetype_, sizeof(filetype_), fd) == NULL ||
 	    fgets(version_, sizeof(version_), fd) == NULL)
@@ -149,37 +171,62 @@ open_for_read_filename:(const char *)filename dir:(XLogDir *)dir
 			say_error("unexpected EOF reading %s", filename);
 		else
 			say_syserror("can't read header of %s", filename);
-		fclose(fd);
-		return nil;
+		goto error;
 	}
 
 	if (dir != NULL && strncmp(dir->filetype, filetype_, sizeof(filetype_)) != 0) {
 		say_error("filetype mismatch of %s", filename);
-		fclose(fd);
-		return nil;
+		goto error;
 	}
 
 	if (strcmp(version_, v11) == 0) {
 		l = [XLog11 alloc];
 	} else if (strcmp(version_, v12) == 0) {
 		l = [XLog12 alloc];
-	} else {
+	} else if (strcmp(version_, v04) == 0) {
+		if (version4 != nil) {
+			l = [version4 alloc];
+		} else {
+			l = [XLog04 alloc];
+		}
+	} else if (strcmp(version_, v03) == 0) {
+		if (version3 != nil) {
+			l = [version3 alloc];
+		}
+	}
+	if (l == nil) {
 		say_error("bad version `%s' of %s", version_, filename);
-		fclose(fd);
-		return nil;
+		goto error;
 	}
 
-	[l init_filename:filename fd:fd dir:dir];
+	[l init_filename:filename fd:fd dir:dir vbuf:fbuf];
 	if ([l read_header] < 0) {
 		if (feof(fd))
 			say_error("unexpected EOF reading %s", filename);
 		else
 			say_syserror("can't read header of %s", filename);
-		[l free];
+		[l free]; /* will do correct cleanup */
 		return nil;
 	}
 
 	return l;
+
+error:
+	fclose(fd);
+	free(fbuf);
+	return nil;
+}
+
++ (void)
+register_version3: (Class)xlog
+{
+	version3 = xlog;
+}
+
++ (void)
+register_version4: (Class)xlog
+{
+	version4 = xlog;
 }
 
 - (id)
@@ -191,7 +238,6 @@ free
 
 	free(filename);
 	free(vbuf);
-	palloc_destroy_pool(pool);
 	return [super free];
 }
 
@@ -247,7 +293,7 @@ close
 			result = -1;
 	} else {
 		if (rows == 0 && access(filename, F_OK) == 0) {
-			bool legacy_snap = [self isMemberOf:[XLog11 class]] &&
+			bool legacy_snap = ![self isMemberOf:[XLog12 class]] &&
 					   [dir isMemberOf:[SnapDir class]];
 			if (!legacy_snap)
 				panic("no valid rows were read");
@@ -267,8 +313,12 @@ close
 - (int)
 flush
 {
-	if (fflush(fd) < 0)
+	if (fflush(fd) < 0) {
+		/* prevent silent drop of wet rows.
+		   it's required to call [confirm_write] in case of wet file */
+		assert(wet_rows == 0);
 		return -1;
+	}
 
 #if HAVE_FDATASYNC
 	if (fdatasync(fileno(fd)) < 0) {
@@ -323,36 +373,58 @@ read_row
 	return NULL;
 }
 
+- (marker_desc_t)
+marker_desc
+{
+	return (marker_desc_t){
+		.marker = (u64)marker,
+		.eof = (u64)eof_marker,
+		.size = 4,
+		.eof_size = 4
+	};
+}
+
 - (struct row_v12 *)
 fetch_row
 {
 	struct row_v12 *row;
-	u32 magic;
+	u64 magic, magic_shift;
 	off_t marker_offset = 0, good_offset, eof_offset;
+	marker_desc_t mdesc = [self marker_desc];
 
-	assert(sizeof(magic) == sizeof(marker));
+	magic = 0;
+	magic_shift = (mdesc.size - 1) * 8;
 	good_offset = ftello(fd);
 
 restart:
+
+	/*
+	 * reset stream status if we reached eof before,
+	 * subsequent fread() call could cache (at least on
+	 * FreeBSD) eof cache status
+	 */
+	if (feof(fd))
+		clearerr(fd);
+
 	if (marker_offset > 0)
 		fseeko(fd, marker_offset + 1, SEEK_SET);
 
 	say_debug("%s: start offt %08" PRIofft, __func__, ftello(fd));
-	if (fread(&magic, sizeof(marker), 1, fd) != 1)
+	if (fread(&magic, mdesc.size, 1, fd) != 1)
 		goto eof;
 
-	while (magic != marker) {
+	while (magic != mdesc.marker) {
 		int c = fgetc(fd);
 		if (c == EOF)
 			goto eof;
 		magic >>= 8;
-		magic |= (((u32)c & 0xff) << ((sizeof(magic) - 1) * 8));
+		magic |= ((u64)c & 0xff) << magic_shift;
 	}
-	marker_offset = ftello(fd) - sizeof(marker);
+	marker_offset = ftello(fd) - mdesc.size;
 	if (good_offset != marker_offset)
 		say_warn("skipped %" PRIofft " bytes after %08" PRIofft " offset",
 			 marker_offset - good_offset, good_offset);
-	say_debug("magic found at %08" PRIofft, marker_offset);
+	say_debug("	magic found at %08" PRIofft, marker_offset);
 
 	row = [self read_row];
 
@@ -365,20 +437,28 @@ restart:
 	}
 
 	++rows;
-	if ((row->tag & ~TAG_MASK) == 0) /* old style row */
-		row->tag = fix_tag(row->tag);
 	return row;
 eof:
 	eof_offset = ftello(fd);
-	if (eof_offset == good_offset + sizeof(eof_marker)) {
+	if (eof_offset == good_offset + mdesc.eof_size) {
+		if (mdesc.eof_size == 0) {
+			eof = 1;
+			return NULL;
+		}
+
 		fseeko(fd, good_offset, SEEK_SET);
 
-		if (fread(&magic, sizeof(eof_marker), 1, fd) != 1) {
+		magic = 0;
+		/* reset stream status if we reached eof before */
+		if (feof(fd))
+			clearerr(fd);
+
+		if (fread(&magic, mdesc.eof_size, 1, fd) != 1) {
 			fseeko(fd, good_offset, SEEK_SET);
 			return NULL;
 		}
 
-		if (memcmp(&magic, &eof_marker, sizeof(eof_marker)) != 0) {
+		if (magic != mdesc.eof) {
 			fseeko(fd, good_offset, SEEK_SET);
 			return NULL;
 		}
@@ -395,10 +475,19 @@ eof:
 }
 
 - (void)
-follow:(follow_cb *)cb
+follow:(follow_cb *)cb data:(void *)data
 {
-	ev_stat_stop(&stat);
+	if (ev_is_active(&stat))
+		return;
+
+	if (cb == NULL) {
+		ev_stat_stop(&stat);
+		return;
+	}
+
 	ev_stat_init(&stat, cb, filename, 0.);
+	stat.interval = (ev_tstamp)cfg.wal_dir_rescan_delay / 10;
+	stat.data = data;
 	ev_stat_start(&stat);
 }
 
@@ -424,35 +513,45 @@ append_successful:(size_t)bytes
 	wet_rows++;
 }
 
-- (i64)
+static void
+assert_row(const struct row_v12 *row)
+{
+	(void)row;
+	assert(row->tag & ~TAG_MASK);
+	assert(row->len > 0); /* fwrite() has funny behavior if size == 0 */
+}
+
+- (const struct row_v12 *)
 append_row:(struct row_v12 *)row data:(const void *)data
 {
 	(void)row; (void)data;
 	panic("%s: virtual", __func__);
 }
 
-- (i64)
+- (const struct row_v12 *)
 append_row:(void *)data len:(u32)len scn:(i64)scn tag:(u16)tag
 {
 	assert(wet_rows < nelem(wet_rows_offset));
-	struct row_v12 row = { .scn = scn ?: 0,
-			       .tm = ev_now(),
-			       .tag = tag,
-			       .cookie = default_cookie,
-			       .len = len };
+	static struct row_v12 row;
+	row = (struct row_v12){ .scn = scn,
+				.tm = ev_now(),
+				.tag = tag,
+				.cookie = default_cookie,
+				.len = len };
 
 	return [self append_row:&row data:data];
 }
 
-- (i64)
+- (const struct row_v12 *)
 append_row:(const void *)data len:(u32)len scn:(i64)scn tag:(u16)tag cookie:(u64)cookie
 {
 	assert(wet_rows < nelem(wet_rows_offset));
-	struct row_v12 row = { .scn = scn ?: 0,
-			       .tm = ev_now(),
-			       .tag = tag,
-			       .cookie = cookie,
-			       .len = len };
+	static struct row_v12 row;
+	row = (struct row_v12){ .scn = scn,
+				.tm = ev_now(),
+				.tag = tag,
+				.cookie = cookie,
+				.len = len };
 
 	return [self append_row:&row data:data];
 }
@@ -470,6 +569,8 @@ confirm_write
 	off_t tail;
 
 	if (fflush(fd) < 0) {
+		say_syserror("fflush");
+
 		tail = ftello(fd);
 
 		say_debug("%s offset:%llu tail:%lli", __func__, (long long)offset, (long long)tail);
@@ -505,6 +606,126 @@ confirm_write
 
 @end
 
+@implementation XLog04
+- (u32) version { return 4; }
+
+- (marker_desc_t)
+marker_desc
+{
+	return (marker_desc_t){
+		.marker = (u64)-1,
+		.eof = (u64)0,
+		.size = 8,
+		.eof_size = 8
+	};
+}
+
+- (int)
+read_header
+{
+	char buf[256];
+	char *r;
+	int n, year, mon, day, hour, min, sec;
+	r = fgets(buf, sizeof(buf), fd);
+	if (r == NULL)
+		return -1;
+	n = sscanf(r, "%d %d %d %d:%d:%d\n", &year, &mon, &day, &hour, &min, &sec);
+	if (n != 6) {
+		return -1;
+	}
+	return 0;
+}
+
+struct tbuf *
+convert_row_v04_to_v12(struct tbuf *m)
+{
+	struct tbuf *n = tbuf_alloc(m->pool);
+	tbuf_append(n, NULL, sizeof(struct row_v12));
+	row_v12(n)->scn = row_v12(n)->lsn = _row_v04(m)->lsn;
+	row_v12(n)->tm = 0;
+	row_v12(n)->len = _row_v04(m)->len + sizeof(u16); /* tag */
+	row_v12(n)->tag = wal_data | TAG_WAL;
+	row_v12(n)->cookie = default_cookie;
+
+	tbuf_add_dup(n, &_row_v04(m)->type);
+	tbuf_ltrim(m, sizeof(struct _row_v04));
+	tbuf_append(n, m->ptr, row_v12(n)->len - sizeof(u16));
+
+	row_v12(n)->data_crc32c = crc32c(0, row_v12(n)->data, row_v12(n)->len);
+	row_v12(n)->header_crc32c = crc32c(0, n->ptr + field_sizeof(struct row_v12, header_crc32c),
+					   sizeof(struct row_v12) - field_sizeof(struct row_v12, header_crc32c));
+
+	return n;
+}
+
+- (struct row_v12 *)
+read_row
+{
+	struct tbuf *m = tbuf_alloc(fiber->pool);
+
+	u32 row_crc, calc_crc;
+	tbuf_append(m, NULL, sizeof(struct _row_v04));
+	if (fread(m->ptr, sizeof(struct _row_v04), 1, fd) != 1) {
+		if (ferror(fd))
+			say_error("fread error");
+		return NULL;
+	}
+
+	tbuf_append(m, NULL, _row_v04(m)->len);
+	if (fread(_row_v04(m)->data, _row_v04(m)->len, 1, fd) != 1) {
+		if (ferror(fd))
+			say_error("fread error");
+		return NULL;
+	}
+
+	if (fread(&row_crc, sizeof(row_crc), 1, fd) != 1) {
+		if (ferror(fd))
+			say_error("fread error");
+		return NULL;
+	}
+
+	calc_crc = crc32(m->ptr, tbuf_len(m));
+	if (row_crc != calc_crc) {
+		say_error("data crc32c mismatch %x %x", row_crc, calc_crc);
+		return NULL;
+	}
+
+	say_debug("read row v04 success lsn:%"PRIu64, _row_v04(m)->lsn);
+
+	return convert_row_v04_to_v12(m)->ptr;
+}
+
+@end
+
+@implementation XLog03Template
+- (u32) version { return 3; }
+
+- (int)
+read_header
+{
+	char buf[256];
+	char *r;
+	int n, year, mon, day, hour, min, sec;
+	r = fgets(buf, sizeof(buf), fd);
+	if (r == NULL)
+		return -1;
+	n = sscanf(r, "%d %d %d %d:%d:%d\n", &year, &mon, &day, &hour, &min, &sec);
+	if (n != 6) {
+		return -1;
+	}
+	return 0;
+}
+
+- (marker_desc_t)
+marker_desc
+{
+	return (marker_desc_t){
+		.marker = (u64)0xffffffff,
+		.size = 4,
+		.eof_size = 0
+	};
+}
+@end
 
 @implementation XLog11
 - (u32) version { return 11; }
@@ -522,9 +743,9 @@ convert_row_v11_to_v12(struct tbuf *m)
 
 	u16 tag = read_u16(m);
 	if (tag == (u16)-1) {
-		row_v12(n)->tag = snap_tag;
+		row_v12(n)->tag = snap_data|TAG_SNAP;
 	} else if (tag == (u16)-2) {
-		row_v12(n)->tag = wal_tag;
+		row_v12(n)->tag = wal_data|TAG_WAL;
 	} else {
 		say_error("unknown tag %i", (int)tag);
 		return NULL;
@@ -557,7 +778,7 @@ write_header
 - (struct row_v12 *)
 read_row
 {
-	struct tbuf *m = tbuf_alloc(pool);
+	struct tbuf *m = tbuf_alloc(fiber->pool);
 
 	u32 header_crc, data_crc;
 
@@ -605,45 +826,49 @@ read_row
 }
 
 
-- (i64)
-append_row:(struct row_v12 *)row_ data:(const void *)data
+- (const struct row_v12 *)
+append_row:(struct row_v12 *)row12 data:(const void *)data
 {
-	assert(row_->tag & ~TAG_MASK);
+	assert_row(row12);
 	struct _row_v11 row;
-	u16 tag = row_->tag & TAG_MASK;
-	i64 scn = row_->scn;
-	u32 data_len = row_->len;
-	u64 cookie = row_->cookie;
+	u16 tag = row12->tag & TAG_MASK;
+	u32 data_len = row12->len;
+	u64 cookie = row12->cookie;
 
 	assert(wet_rows < nelem(wet_rows_offset));
-	if (tag == snap_tag) {
+
+	if (tag == snap_data) {
 		tag = (u16)-1;
-	} else if (tag == wal_tag) {
+	} else if (tag == wal_data) {
 		tag = (u16)-2;
-	} else if (tag == snap_initial_tag ||
-		   tag == snap_final_tag ||
-		   tag == wal_final_tag)
+	} else if (tag == snap_initial ||
+		   tag == snap_final ||
+		   tag == wal_final)
 	{
-		return 0;
+		/* SEGV value non equal to NULL */
+		return (const struct row_v12 *)(intptr_t)1;
 	} else {
 		say_error("unknown tag %i", (int)tag);
 		errno = EINVAL;
-		return -1;
+		return NULL;
 	}
 
 
-	row.lsn = [self next_lsn];
+	row12->lsn = row.lsn = [self next_lsn];
+	if (row12->scn == 0)
+		row12->scn = row.lsn;
 
 	/* When running remote recovery of octopus (read: we'r replica) remote rows
 	   come in v12 format with SCN != 0.
 	   If cfg.io_compat enabled, ensure invariant LSN == SCN, since in this mode
 	   rows doesn't have distinct SCN field. */
 
-	if (scn != 0 && scn != row.lsn) {
+	if (row12->scn != row12->lsn) {
 		say_error("io_compat mode doesn't support SCN tagged rows");
 		errno = EINVAL;
-		return -1;
+		return NULL;
 	}
+
 
 	row.tm = ev_now();
 	row.len = sizeof(tag) + sizeof(cookie) + data_len;
@@ -662,13 +887,13 @@ append_row:(struct row_v12 *)row_ data:(const void *)data
 	    fwrite(data, data_len, 1, fd) != 1)
 	{
 		say_syserror("fwrite");
-		return -1;
+		return NULL;
 	}
 
 	[self append_successful:sizeof(marker) + sizeof(row) +
 				sizeof(tag) + sizeof(cookie) +
 	                        data_len];
-	return 1;
+	return row12;
 }
 
 @end
@@ -720,10 +945,62 @@ write_header
 	return 0;
 }
 
+u16
+fix_tag_v2(u16 tag)
+{
+	switch (tag) {
+	case snap_initial:	return tag|TAG_SNAP;
+	case snap_data:		return tag|TAG_SNAP;
+	case wal_data:		return tag|TAG_WAL;
+	case snap_final:	return tag|TAG_SNAP;
+	case wal_final:		return tag|TAG_WAL;
+	case run_crc:		return tag|TAG_WAL;
+	case nop:		return tag|TAG_WAL;
+	case snap_skip_scn:	return tag|TAG_SNAP;
+	case paxos_prepare:	return tag|TAG_SYS;
+	case paxos_promise:	return tag|TAG_SYS;
+	case paxos_propose:	return tag|TAG_SYS;
+	case paxos_accept:	return tag|TAG_SYS;
+	case paxos_nop:		return tag|TAG_SYS;
+	default:		abort();
+	}
+}
+
+static u16
+fix_tag_v3(u16 tag)
+{
+	switch (tag) {
+	case snap_data:		return tag|TAG_SNAP;
+	case wal_data:		return tag|TAG_WAL;
+	case snap_initial:
+	case snap_final:
+	case wal_final:
+	case run_crc:
+	case nop:
+	case snap_skip_scn:
+	case paxos_prepare:
+	case paxos_promise:
+	case paxos_propose:
+	case paxos_accept:
+	case paxos_nop:		return tag|TAG_SYS;
+	default:		abort();
+	}
+}
+
+void
+fixup_row_v12(struct row_v12 *row)
+{
+	if (cfg.io12_hack && row->scn == 0)
+		row->scn = row->lsn;
+
+	if ((row->tag & ~TAG_MASK) == 0) /* old style row */
+		row->tag = fix_tag_v3(row->tag);
+}
+
 - (struct row_v12 *)
 read_row
 {
-	struct tbuf *m = tbuf_alloc(pool);
+	struct tbuf *m = tbuf_alloc(fiber->pool);
 
 	u32 header_crc, data_crc;
 
@@ -765,15 +1042,17 @@ read_row
 		return NULL;
 	}
 
+	fixup_row_v12(row_v12(m));
 	say_debug("read row v12 success lsn:%" PRIi64, row_v12(m)->lsn);
 
 	return m->ptr;
 }
 
-- (i64)
+- (const struct row_v12 *)
 append_row:(struct row_v12 *)row data:(const void *)data
 {
-	assert(row->tag & ~TAG_MASK);
+	assert_row(row);
+
 	row->lsn = [self next_lsn];
 	row->scn = row->scn ?: row->lsn;
 	row->data_crc32c = crc32c(0, data, row->len);
@@ -785,11 +1064,11 @@ append_row:(struct row_v12 *)row data:(const void *)data
 	    fwrite(data, row->len, 1, fd) != 1)
 	{
 		say_syserror("fwrite");
-		return -1;
+		return NULL;
 	}
 
 	[self append_successful:sizeof(marker) + sizeof(*row) + row->len];
-	return row->scn;
+	return row;
 }
 
 @end
@@ -799,7 +1078,16 @@ append_row:(struct row_v12 *)row data:(const void *)data
 init_dirname:(const char *)dirname_
 {
         dirname = dirname_;
+	fd = open(dirname, O_RDONLY);
+	if (fd < 0)
+		say_syserror("can't open wal_dir");
         return self;
+}
+
+- (int)
+lock
+{
+	return flock(fd, LOCK_EX|LOCK_NB);
 }
 
 static int
@@ -947,7 +1235,9 @@ containg_scn:(i64)target_scn
 		if (scn == 0)
 			scn = lsn[i];
 
-		if (scn >= target_scn)
+		if (scn == target_scn)
+			return lsn[i];
+		if (scn > target_scn)
 			return i > 0 ? lsn[i - 1] : initial_lsn;
 	}
 
@@ -990,9 +1280,8 @@ open_for_write:(i64)lsn scn:(i64)scn
 {
         XLog *l = nil;
         FILE *file = NULL;
-	int fd = -1;
         assert(lsn > 0);
-
+	char *fbuf = NULL;
 
 	const char *final_filename = [self format_filename:lsn];
 	if (access(final_filename, F_OK) == 0) {
@@ -1009,16 +1298,21 @@ open_for_write:(i64)lsn scn:(i64)scn
 		say_syserror("fopen failed");
 		goto error;
 	}
+	fbuf = set_file_buf(file);
 
 	if (cfg.io_compat) {
-		l = [[XLog11 alloc] init_filename:filename fd:file dir:self];
+		l = [[XLog11 alloc] init_filename:filename fd:file dir:self vbuf:fbuf];
 		l->next_lsn = lsn;
 
 	} else {
-		l = [[XLog12 alloc] init_filename:filename fd:file dir:self];
+		l = [[XLog12 alloc] init_filename:filename fd:file dir:self vbuf:fbuf];
 		l->next_lsn = lsn;
 		((XLog12 *)l)->next_scn = scn;
 	}
+
+	/* reset local variables: they are included in l */
+	fbuf = NULL;
+	file = NULL;
 
 	l->mode = LOG_WRITE;
 	l->inprogress = 1;
@@ -1030,10 +1324,10 @@ open_for_write:(i64)lsn scn:(i64)scn
 
 	return l;
       error:
-	if (fd >= 0)
-		close(fd);
         if (file != NULL)
                 fclose(file);
+	if (fbuf != NULL)
+		free(fbuf);
         [l free];
 	return NULL;
 }

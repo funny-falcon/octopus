@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2011 Mail.RU
- * Copyright (C) 2011 Yuriy Vostrikov
+ * Copyright (C) 2011, 2013 Mail.RU
+ * Copyright (C) 2011, 2013 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -155,14 +155,14 @@ alloc
 	abort(); /* + palloc should be used */
 }
 
-- (Error *)
-init:(char *)reason_
+-
+init:(const char *)reason_
 {
 	reason = reason_;
 	return self;
 }
 
-- (Error *)
+-
 init_line:(unsigned)line_
      file:(const char *)file_
 backtrace:(const char *)backtrace_
@@ -178,7 +178,7 @@ backtrace:(const char *)backtrace_
 	return self;
 }
 
-- (Error *)
+-
 init_line:(unsigned)line_
      file:(const char *)file_
 backtrace:(const char *)backtrace_

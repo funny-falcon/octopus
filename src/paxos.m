@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2011, 2012 Mail.RU
- * Copyright (C) 2011, 2012 Yuriy Vostrikov
+ * Copyright (C) 2011, 2012, 2013, 2014 Mail.RU
+ * Copyright (C) 2011, 2012, 2013, 2014 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -61,7 +61,7 @@ struct paxos_peer {
 	struct iproto_peer iproto;
 	int id;
 	const char *name, *primary_addr;
-	struct sockaddr_in feeder_addr;
+	struct feeder_param feeder;
 	SLIST_ENTRY(paxos_peer) link;
 };
 
@@ -81,8 +81,10 @@ make_paxos_peer(int id, const char *name, const char *addr,
 	paddr.sin_port = htons(primary_port);
 	p->primary_addr = strdup(sintoa(&paddr));
 
-	p->feeder_addr = p->iproto.addr;
-	p->feeder_addr.sin_port = htons(feeder_port);
+	memset(&p->feeder, 0, sizeof(p->feeder));
+	p->feeder.ver = 1;
+	p->feeder.addr = p->iproto.addr;
+	p->feeder.addr.sin_port = htons(feeder_port);
 	return p;
 }
 
@@ -164,7 +166,7 @@ proposal_cmp(const struct proposal *a, const struct proposal *b)
 	return (a->scn < b->scn) ? -1 : (a->scn > b->scn);
 }
 #ifndef __unused
-#define __unused    __attribute__((__unused__))
+#define __unused    _unused_
 #endif
 RB_GENERATE_STATIC(ptree, proposal, link, proposal_cmp)
 
@@ -175,10 +177,7 @@ static const ev_tstamp paxos_default_timeout = 0.2;
 
 struct service *mesh_service;
 
-extern void title(const char *fmt, ...); /* FIXME: hack */
-
 static int catchup_done;
-
 static void catchup(PaxosRecovery *r, i64 upto_scn);
 
 static bool
@@ -201,16 +200,19 @@ paxos_broadcast(PaxosRecovery *r, enum paxos_msg_code code, ev_tstamp timeout,
 				 .tag = tag,
 				 .value_len = value_len };
 
-	struct iproto_req *req = req_make(paxos_msg_code[code], quorum, timeout,
-					  &msg.header, value, value_len);
+	struct iproto_req *req = iproto_req_make(code, timeout, paxos_msg_code[code]);
 
 	say_debug("%s: > %s sync:%u SCN:%"PRIi64" ballot:%"PRIu64" timeout:%.2f",
-		  __func__, paxos_msg_code[code], req->header->sync, scn, ballot, timeout);
+		  __func__, paxos_msg_code[code], req->header.sync, scn, ballot, timeout);
 	if (code != PREPARE)
 		say_debug2("|  tag:%s value_len:%i value:%s", xlog_tag_to_a(tag), value_len,
 			   tbuf_to_hex(&TBUF(value, value_len, fiber->pool)));
 
-	broadcast(&r->remotes, req);
+	struct iovec iov[2] = { { .iov_base = (char *)&msg + sizeof(struct iproto),
+				  .iov_len = sizeof(msg) - sizeof(struct iproto) },
+				{ .iov_base = (void *)value,
+				  .iov_len = value_len } };
+	iproto_broadcast(&r->remotes, quorum, req, iov, 2);
 }
 
 
@@ -222,7 +224,7 @@ paxos_reply(struct paxos_request *req, enum paxos_msg_code code, u64 ballot)
 	struct conn *c = req->c;
 
 	if (c->state < CONNECTED) {
-		say_debug("not connected: ignoring fd:%i start:%i", c->fd, c->state);
+		say_debug("not connected: ignoring fd:%i state:%i", c->fd, c->state);
 		return;
 	}
 
@@ -274,9 +276,16 @@ notify_leadership_change(PaxosRecovery *r)
 		if (prev_leader != leader_id) {
 			say_info("I am leader, %i -> %i", prev_leader, leader_id);
 			catchup_done = 0;
-			while (r->app_scn < r->max_scn)
-				catchup(r, r->max_scn);
+
+			catchup(r, r->max_scn);
 			catchup_done = 1;
+			if (r->app_scn < r->max_scn) {
+				say_warn("leader catchup failed AppSCN:%"PRIi64" MaxSCN:%"PRIi64,
+					 r->app_scn, r->max_scn);
+				leader_id = -2;
+				title("paxos_catchup_fail");
+				return;
+			}
 		}
 		title("paxos_leader");
 	}
@@ -301,6 +310,9 @@ propose_leadership(va_list ap)
 					     .peer_id = self_id,
 					     .version = paxos_default_version,
 					     .leader_id = self_id };
+	struct iovec iov[1] = { { .iov_base = (char *)&leader_propose + sizeof(struct iproto),
+				  .iov_len = sizeof(leader_propose) - sizeof(struct iproto) } };
+
 	fiber_sleep(0.3); /* wait connections to be up */
 	for (;;) {
 		if (ev_now() > leadership_expire)
@@ -322,8 +334,9 @@ propose_leadership(va_list ap)
 			continue;
 
 		leader_propose.expire = ev_now() + leader_lease_interval;
-		broadcast(&r->remotes, req_make("leader_propose", quorum, 1.0,
-						&leader_propose.header, NULL, 0));
+		iproto_broadcast(&r->remotes, quorum, iproto_req_make(LEADER_PROPOSE, 1.0, "leader_propose"),
+				 iov, 1);
+
 		struct iproto_req *req = yield();
 
 		int votes = 0;
@@ -351,7 +364,7 @@ propose_leadership(va_list ap)
 				say_debug("%s: no quorum v/q:%i/%i", __func__, votes, req->quorum);
 			}
 		}
-		req_release(req);
+		iproto_req_release(req);
 		notify_leadership_change(r);
 	}
 }
@@ -646,6 +659,11 @@ mark_applied(PaxosRecovery *r, struct proposal *p)
 static void
 learn(PaxosRecovery *r, struct proposal *p)
 {
+	if (p == NULL && r->app_scn < r->max_scn)
+		p = proposal(r, r->app_scn + 1);
+
+	say_debug("%s: from SCN:%"PRIi64, __func__, p ? p->scn : -1);
+
 	for (; p != NULL; p = RB_NEXT(ptree, &r->proposals, p)) {
 		assert([r scn] <= r->app_scn);
 		assert(r->app_scn <= r->max_scn);
@@ -664,14 +682,15 @@ learn(PaxosRecovery *r, struct proposal *p)
 			   p->value_len, tbuf_to_hex(&TBUF(p->value, p->value_len, fiber->pool)));
 
 
-		id<Txn> txn = [r->txn_class palloc];
-		struct row_v12 row = { .scn = p->scn,
-				       .tag = p->tag,
-				       .len = p->value_len };
-		[txn prepare:&row data:p->value];
-		[txn commit];
-
-		mark_applied(r, p);
+		@try {
+			[r apply:&TBUF(p->value, p->value_len, fiber->pool) tag:p->tag];
+			mark_applied(r, p);
+		}
+		@catch (Error *e) {
+			say_warn("aborting txn, [%s reason:\"%s\"] at %s:%d",
+				 [[e class] name], e->reason, e->file, e->line);
+			break;
+		}
 	}
 }
 
@@ -808,7 +827,7 @@ retry:
 		goto retry;
 	}
 
-	say_debug("PREPARE reply sync:%i SCN:%"PRIi64, rsp->sync, p->scn);
+	say_debug("PREPARE reply sync:%i SCN:%"PRIi64, rsp->header.sync, p->scn);
 	struct msg_paxos *max = NULL;
 	reply_count = votes = 0;
 	FOREACH_REPLY(rsp, reply) {
@@ -829,24 +848,28 @@ retry:
 		case DECIDE:
 			update_proposal_value(p, mp->value_len, mp->value, mp->tag);
 			update_proposal_ballot(p, ULLONG_MAX);
-			req_release(rsp);
+			iproto_req_release(rsp);
 			goto decide;
 		case STALE: {
 			struct paxos_peer *p;
+			XLogPuller *puller = [[XLogPuller alloc] init];
+
 			SLIST_FOREACH(p, &r->group, link) {
 				if (p->id == self_id)
 					continue;
 
 				say_debug("feeding from %s", p->name);
-				XLogPuller *puller = [[XLogPuller alloc] init_addr:&p->feeder_addr];
-				[r recover_follow_remote:puller exit_on_eof:true];
-				[puller free];
+				[puller feeder_param:&p->feeder];
+				if ([puller handshake:[r scn] err:NULL] <= 0)
+					continue;
+				while ([r pull_wal:puller] != 1);
 				break;
 			}
+			[puller free];
 			return 0;
 		}
 		default:
-			assert(false);
+			abort();
 		}
 	}
 	if (reply_count == 0)
@@ -858,7 +881,7 @@ retry:
 			ballot = nack_ballot;
 		}
 
-		req_release(rsp);
+		iproto_req_release(rsp);
 		fiber_sleep(0.001 * rand() / RAND_MAX);
 		goto retry;
 	}
@@ -875,13 +898,13 @@ retry:
 		value_len = max->value_len;
 		tag = max->tag;
 	}
-	req_release(rsp);
+	iproto_req_release(rsp);
 
 	rsp = propose(r, ballot, p->scn, value, value_len, tag);
 	if (rsp == NULL)
 		goto retry;
 
-	say_debug("PROPOSE reply sync:%i SCN:%"PRIi64, rsp->sync, p->scn);
+	say_debug("PROPOSE reply sync:%i SCN:%"PRIi64, rsp->header.sync, p->scn);
 	reply_count = votes = 0;
 	FOREACH_REPLY(rsp, reply) {
 		reply_count++;
@@ -896,7 +919,7 @@ retry:
 		case DECIDE:
 			update_proposal_value(p, mp->value_len, mp->value, mp->tag);
 			update_proposal_ballot(p, ULLONG_MAX);
-			req_release(rsp);
+			iproto_req_release(rsp);
 			goto decide;
 			break;
 		case NACK:
@@ -907,7 +930,7 @@ retry:
 	if (reply_count == 0)
 		say_debug("|  SCN:%"PRIi64" EMPTY", p->scn);
 
-	req_release(rsp);
+	iproto_req_release(rsp);
 
 	if (votes < quorum) {
 		if (nack_ballot > ballot) { /* we have a hint about ballot */
@@ -915,7 +938,7 @@ retry:
 			ballot = nack_ballot;
 		}
 
-		req_release(rsp);
+		iproto_req_release(rsp);
 		fiber_sleep(0.001 * rand() / RAND_MAX);
 		goto retry;
 	}
@@ -1008,26 +1031,34 @@ loop:
 }
 
 
-static void
+static u64
 close_with_nop(PaxosRecovery *r, struct proposal *p)
 {
 	say_debug("%s: SCN:%"PRIi64, __func__, p->scn);
 	assert(p->ballot != ULLONG_MAX);
-	run_protocol(r, p, "\0\0", 2, TAG_WAL | nop);
+	return run_protocol(r, p, "\0\0", 2, TAG_WAL | nop);
 }
 
 
 static void
 catchup(PaxosRecovery *r, i64 upto_scn)
 {
-	say_debug("%s: SCN:%"PRIi64 " upte_scn:%"PRIi64, __func__, [r scn], upto_scn);
+	say_debug("%s: SCN:%"PRIi64 " upto_scn:%"PRIi64, __func__, [r scn], upto_scn);
 
 	for (i64 i = r->app_scn + 1; i <= upto_scn; i++) {
 		struct proposal *p = proposal(r, i);
-		if (p->ballot != ULLONG_MAX)
-			close_with_nop(r, p);
-		learn(r, p);
+		say_debug("|	SCN:%"PRIi64" ballot:%"PRIi64, p->scn, p->ballot);
+		if (p->ballot == ULLONG_MAX)
+			continue;
+
+		if (close_with_nop(r, p) != ULLONG_MAX) {
+			say_warn("can't close SCN:%"PRIi64, p->scn);
+			/* undecided proposal between app_scn and max_scn:
+			   learning upto max_scn is impossible */
+			return;
+		}
 	}
+	learn(r, NULL);
 }
 
 void
@@ -1052,18 +1083,16 @@ loop:
 init_snap_dir:(const char *)snap_dirname
       wal_dir:(const char *)wal_dirname
  rows_per_wal:(int)wal_rows_per_file
-  feeder_addr:(const char *)feeder_addr_
+ feeder_param:(struct feeder_param*)param
 	flags:(int)flags
-    txn_class:(Class)txn_class_
 {
 	struct octopus_cfg_paxos_peer *c;
 
 	[super init_snap_dir:snap_dirname
 		     wal_dir:wal_dirname
 		rows_per_wal:wal_rows_per_file
-		 feeder_addr:feeder_addr_
-		       flags:flags
-		   txn_class:txn_class_];
+		feeder_param:param
+		       flags:flags];
 
 	SLIST_INIT(&group);
 	RB_INIT(&proposals);
@@ -1117,22 +1146,32 @@ enable_local_writes
 	if (scn != 0)
 		[self configure_wal_writer];
 
+	XLogPuller *puller = [[XLogPuller alloc] init];
 	for (;;) {
 		struct paxos_peer *p;
 		SLIST_FOREACH(p, &group, link) {
 			if (p->id == self_id)
 				continue;
 
-			say_debug("feeding from %s", p->name);
-			XLogPuller *puller = [[XLogPuller alloc] init_addr:&p->feeder_addr];
-			[self recover_follow_remote:puller exit_on_eof:true];
-			[puller free];
+			[puller feeder_param:&p->feeder];
+			if ([puller handshake:scn err:NULL] <= 0)
+				continue;
+
+			say_debug("loading from %s", p->name);
+			@try {
+				[self load_from_remote:puller];
+			}
+			@finally {
+				[puller close];
+			}
+
 			if ([self scn] > 0)
 				goto exit;
 		}
 		fiber_sleep(1);
 	}
 exit:
+	[puller free];
 	if (!configured)
 		[self configure_wal_writer];
 
@@ -1146,7 +1185,7 @@ exit:
 	struct proposal *min = RB_MIN(ptree, &self->proposals);
 	say_info("SCN:%"PRIi64" minSCN:%"PRIi64" appSCN:%"PRIi64" maxSCN:%"PRIi64,
 		 scn, min ? min->scn : -1, app_scn, max_scn);
-	strcpy(status, "active");
+	[self status_update:"active"];
 
 	const char *addr = sintoa(&paxos_peer(self, self_id)->iproto.addr);
 	tcp_service(&service, addr, NULL, iproto_wakeup_workers);
@@ -1158,7 +1197,7 @@ exit:
 	for (int i = 0; i < 3; i++)
 		fiber_create("paxos/worker", iproto_worker, &service);
 
-	reply_reader = fiber_create("paxos/reply_reader", iproto_reply_reader, req_collect_reply);
+	reply_reader = fiber_create("paxos/reply_reader", iproto_reply_reader, iproto_collect_reply);
 	fiber_create("paxos/rendevouz", iproto_rendevouz, NULL, &remotes, reply_reader, output_flusher);
 	fiber_create("paxos/elect", propose_leadership, self);
 
@@ -1212,15 +1251,6 @@ check_replica
 }
 
 - (int)
-submit:(id<Txn>)txn
-{
-	if (!configured)
-		return 0;
-	struct row_v12 *r = [txn row];
-	return [self submit:r->data len:r->len tag:r->tag];
-}
-
-- (int)
 submit:(void *)data len:(u32)len tag:(u16)tag
 {
 	if (!configured)
@@ -1267,7 +1297,7 @@ snapshot_write_header_rows:(XLog *)snap
 	if (tbuf_len(buf) == 0)
 		return 0;
 
-	if ([snap append_row:buf->ptr len:tbuf_len(buf) scn:scn tag:(snap_skip_scn | TAG_SNAP)] < 0) {
+	if ([snap append_row:buf->ptr len:tbuf_len(buf) scn:scn tag:(snap_skip_scn | TAG_SNAP)] == NULL) {
 		say_error("unable write snap_applied_scn");
 		return -1;
 	}
@@ -1276,7 +1306,7 @@ snapshot_write_header_rows:(XLog *)snap
 }
 
 - (void)
-recover_row:(const struct row_v12 *)r
+recover_row:(struct row_v12 *)r
 {
 	say_debug("%s: lsn:%"PRIi64" SCN:%"PRIi64" tag:%s", __func__,
 		  r->lsn, r->scn, xlog_tag_to_a(r->tag));

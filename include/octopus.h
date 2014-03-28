@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2010, 2011, 2012 Mail.RU
- * Copyright (C) 2010, 2011, 2012 Yuriy Vostrikov
+ * Copyright (C) 2010, 2011, 2012, 2013, 2014 Mail.RU
+ * Copyright (C) 2010, 2011, 2012, 2013, 2014 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -34,15 +34,22 @@
 #include <stdbool.h>
 
 struct tnt_object {
-	i32 refs;
-	u8 type;
-	u8 flags;
-	u8 data[0];
+	int32_t refs;
+	uint8_t type;
+	uint8_t flags;
+	uint8_t data[0];
 } __attribute__((packed));
+
+enum {
+	TNT_MODULE_WAITING = 0,
+	TNT_MODULE_INPROGRESS = 1,
+	TNT_MODULE_INITED = 2,
+};
 
 struct tnt_module {
 	struct tnt_module *next;
-	const char *name, *version;
+	const char *name, *version, *(*init_before)[], *(*depend_on)[];
+	int _state;
 	void (*init)(void);
 	i32  (*check_config)(struct octopus_cfg *conf);
 	void (*reload_config)(struct octopus_cfg *old_conf, struct octopus_cfg *new_conf);
@@ -51,8 +58,9 @@ struct tnt_module {
 	void (*info)(struct tbuf *out, const char *what);
 	void (*exec)(char *str, int len, struct tbuf *out);
 };
-struct tnt_module *modules_head;
+struct tnt_module *modules_head, *current_module;
 struct tnt_module *module(const char *);
+void module_init(struct tnt_module *);
 void register_module_(struct tnt_module *);
 #define register_module(name)				\
 	__attribute__((constructor)) static void	\
@@ -64,7 +72,6 @@ void register_module_(struct tnt_module *);
 extern struct octopus_cfg cfg;
 extern struct tbuf *cfg_out;
 extern const char *cfg_filename;
-extern char *custom_proc_title;
 extern bool init_storage, booting;
 extern char *binary_filename;
 
@@ -96,6 +103,8 @@ static inline bool ghost(struct tnt_object *obj)
 	return obj->flags & GHOST;
 }
 
+void zero_io_collect_interval();
+void unzero_io_collect_interval();
 
 extern lua_State *root_L;
 struct lua_src {
@@ -109,6 +118,9 @@ const char *objectlib_name;
 void luaT_pushobject(struct lua_State *L, struct tnt_object *obj);
 int luaT_objinit(struct lua_State *L);
 int luaT_require(const char *filename);
+void luaT_require_or_panic(const char *filename, bool panic_on_missing, const char *error_format);
 int luaT_find_proc(lua_State *L, const char *fname, i32 len);
 int luaT_pushptr(struct lua_State *L, void *p);
+int luaT_traceback(lua_State* L);
+void luaT_pushtraceback(lua_State* L);
 #endif

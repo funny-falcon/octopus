@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2010, 2011, 2012 Mail.RU
- * Copyright (C) 2010, 2011, 2012 Yuriy Vostrikov
+ * Copyright (C) 2010, 2011, 2012, 2013 Mail.RU
+ * Copyright (C) 2010, 2011, 2012, 2013 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -60,38 +60,50 @@ tbuf_assert(const struct tbuf *b)
 struct tbuf *
 tbuf_alloc(struct palloc_pool *pool)
 {
-	const size_t initial_size = 128 - sizeof(struct tbuf);
-	struct tbuf *e = palloc(pool, sizeof(*e) + initial_size);
-	e->free = initial_size;
-	e->ptr = e->end = (char *)e + sizeof(*e);
+	struct tbuf *e = palloc(pool, sizeof(*e));
+	e->free = 16;
+	e->ptr = palloc(pool, 16);
+	e->end = e->ptr;
 	e->pool = pool;
-	poison(e->ptr, e->free);
-	tbuf_assert(e);
 	return e;
 }
 
-void __attribute__((regparm(2)))
+#if SIZEOF_VOID_P == 8
+#define _clz(x) __builtin_clzl(x)
+#elif SIZEOF_VOID_P == 4
+#define _clz(x) __builtin_clz(x)
+#endif
+
+void
 tbuf_ensure_resize(struct tbuf *e, size_t required)
 {
 	tbuf_assert(e);
 	assert(e->pool != NULL); /* attemp to resize fixed size tbuf */
 
-	const size_t initial_size = MAX(tbuf_size(e), 128 - sizeof(*e));
-	size_t new_size = initial_size * 2;
+	size_t size = tbuf_size(e);
+	size_t len = tbuf_len(e);
+	size_t req = required - (size - len);
+	size_t diff = size / 2;
+	if (diff < req) {
+		diff = 1 << (sizeof(req) * 8 - 1 - _clz(req));
+		size_t d = diff | (diff >> 1);
+		diff = ((req & d) == d) ? diff << 1 : d;
+	}
 
-	while (new_size - tbuf_len(e) < required)
-		new_size *= 2;
+	void *p = prealloc(e->pool, e->ptr, size, size + diff);
 
-	void *p = palloc(e->pool, new_size);
-	int len = tbuf_len(e);
-
-	poison(p, new_size);
-	memcpy(p, e->ptr, len);
-	poison(e->ptr, len);
 	e->ptr = p;
 	e->end = p + len;
-	e->free = new_size - len;
+	e->free += diff;
 	tbuf_assert(e);
+}
+
+void
+tbuf_willneed(struct tbuf *e, size_t required)
+{
+	assert(tbuf_len(e) <= tbuf_size(e));
+	if (unlikely(tbuf_free(e) < required))
+		tbuf_ensure_resize(e, required);
 }
 
 struct tbuf *
@@ -149,8 +161,8 @@ void
 tbuf_append(struct tbuf *b, const void *data, size_t len)
 {
 	tbuf_assert(b);
+	tbuf_ensure(b, len + 1);
 	if (likely(data != NULL)) {
-		tbuf_ensure(b, len + 1);
 		memcpy(b->end, data, len);
 		*(((char *)b->end) + len) = '\0';
 	}

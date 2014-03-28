@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2010, 2011, 2012 Mail.RU
- * Copyright (C) 2010, 2011, 2012 Yuriy Vostrikov
+ * Copyright (C) 2010, 2011, 2012, 2013 Mail.RU
+ * Copyright (C) 2010, 2011, 2012, 2013 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -34,13 +34,6 @@
 #include <third_party/qsort_arg.h>
 
 @implementation Hash
-- (Hash *)init
-{
-	[super init];
-	type = HASH;
-	unique = true;
-	return self;
-}
 
 - (struct tnt_object *)
 get:(u32)i
@@ -118,12 +111,11 @@ ordered_iterator_init
 
 #define DEFINE_METHODS(type)						\
 - (id)									\
-init									\
+init:(struct index_conf *)ic						\
 {									\
-	[super init];							\
+	[super init:ic];						\
 	h = mh_##type##_init(xrealloc);					\
 	node_size = sizeof(struct tnt_object *) + sizeof(type);		\
-	lua_ctor = luaT_##type##_ctor;					\
 	compare = pattern_compare = (index_cmp)type##_compare;		\
 	return self;							\
 }									\
@@ -137,6 +129,14 @@ find_by_obj:(struct tnt_object *)obj					\
 {									\
 	struct index_node *node_ = GET_NODE(obj, node_a);		\
 	u32 k = mh_##type##_get_node(h, (void *)node_);			\
+	if (k != mh_end(h)) 						\
+		return mh_##type##_value(h, k);				\
+	return NULL;							\
+}									\
+- (struct tnt_object *)							\
+find_by_node:(const struct index_node *)node				\
+{									\
+	u32 k = mh_##type##_get_node(h, (void *)node);			\
 	if (k != mh_end(h)) 						\
 		return mh_##type##_value(h, k);				\
 	return NULL;							\
@@ -164,6 +164,11 @@ iterator_init_with_object:(struct tnt_object *)obj			\
 {									\
 	struct index_node *node_ = GET_NODE(obj, node_a);		\
 	iter = mh_##type##_get_node(h, (void *)node_);			\
+}									\
+- (void)								\
+iterator_init_with_node:(const struct index_node *)node			\
+{									\
+	iter = mh_##type##_get_node(h, node);				\
 }
 
 
@@ -177,7 +182,7 @@ eq:(struct tnt_object *)obj_a :(struct tnt_object *)obj_b
 {
 	struct index_node *na = GET_NODE(obj_a, node_a),
 			  *nb = GET_NODE(obj_b, node_b);
-	return na->u32 == nb->u32;
+	return na->key.u32 == nb->key.u32;
 }
 
 - (struct tnt_object *)
@@ -198,13 +203,9 @@ find_key:(struct tbuf *)key_data with_cardinalty:(u32)key_cardinality
 }
 
 - (struct tnt_object *)
-find:(void *)key
+find:(const char *)key
 {
-	u32 key_size = ((u8 *)key)[0];
-	if (key_size != sizeof(i32))
-		index_raise("key is not i32");
-
-	i32 num = ((i32 *)(key + 1))[0];
+	i32 num = *(i32 *)key;
 	u32 k = mh_i32_get(h, num);
 	if (k != mh_end(h))
 		return mh_i32_value(h, k);
@@ -232,7 +233,7 @@ eq:(struct tnt_object *)obj_a :(struct tnt_object *)obj_b
 {
 	struct index_node *na = GET_NODE(obj_a, node_a),
 			  *nb = GET_NODE(obj_b, node_b);
-	return na->u64 == nb->u64;
+	return na->key.u64 == nb->key.u64;
 }
 
 - (struct tnt_object *)
@@ -253,13 +254,9 @@ find_key:(struct tbuf *)key_data with_cardinalty:(u32)key_cardinality
 }
 
 - (struct tnt_object *)
-find:(void *)key
+find:(const char *)key
 {
-	u32 key_size = ((u8 *)key)[0];
-	if (key_size != sizeof(i64))
-		index_raise("key is not i64");
-
-	i64 num = ((i64 *)(key + 1))[0];
+	i64 num = *(i64 *)key;
 	u32 k = mh_i64_get(h, num);
 	if (k != mh_end(h))
 		return mh_i64_value(h, k);
@@ -287,7 +284,7 @@ eq:(struct tnt_object *)obj_a :(struct tnt_object *)obj_b
 {
 	struct index_node *na = GET_NODE(obj_a, node_a),
 			  *nb = GET_NODE(obj_b, node_b);
-	return lstrcmp(na->str, nb->str) == 0;
+	return lstrcmp(na->key.ptr, nb->key.ptr) == 0;
 }
 
 - (struct tnt_object *)
@@ -304,7 +301,7 @@ find_key:(struct tbuf *)key_data with_cardinalty:(u32)key_cardinality
 }
 
 - (struct tnt_object *)
-find:(void *)key
+find:(const char *)key
 {
 	u32 k = mh_lstr_get(h, key);
 	if (k != mh_end(h))
@@ -330,7 +327,7 @@ eq:(struct tnt_object *)obj_a :(struct tnt_object *)obj_b
 {
 	struct index_node *na = GET_NODE(obj_a, node_a),
 			  *nb = GET_NODE(obj_b, node_b);
-	return strcmp(na->str, nb->str) == 0;
+	return strcmp(na->key.ptr, nb->key.ptr) == 0;
 }
 
 - (struct tnt_object *)
@@ -347,7 +344,7 @@ find_key:(struct tbuf *)key_data with_cardinalty:(u32)key_cardinality
 }
 
 - (struct tnt_object *)
-find:(void *)key
+find:(const char *)key
 {
 	u32 k = mh_cstr_get(h, key);
 	if (k != mh_end(h))

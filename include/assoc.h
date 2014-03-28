@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2011 Mail.RU
- * Copyright (C) 2011 Yuriy Vostrikov
+ * Copyright (C) 2011, 2012, 2013 Mail.RU
+ * Copyright (C) 2011, 2012, 2013 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -33,8 +33,8 @@
 #include <stdlib.h>
 
 typedef void* ptr_t;
-typedef void* lstr;
-typedef void* cstr;
+typedef const void* lstr;
+typedef const void* cstr;
 
 /* All hashes use same layout
    {
@@ -57,26 +57,19 @@ typedef void* cstr;
 #define mh_eq(a, b) ({ *(mh_key_t *)((a) + sizeof(mh_val_t)) == (b); })
 #include <mhash.h>
 
-static inline int lstrcmp(void *a, void *b)
+static inline int lstrcmp(const void *a, const void *b)
 {
-	unsigned int al, bl;
-	u8 ac, bc;
+	int al, bl;
 	int r;
 
-	ac = *(u8 *)a;
-	bc = *(u8 *)b;
+	al = LOAD_VARINT32(a);
+	bl = LOAD_VARINT32(b);
 
-	if (((ac & 0x80) == 0 || (bc & 0x80) == 0) && ac != bc) {
-		r = ac - bc;
-	} else {
-		al = LOAD_VARINT32(a);
-		bl = LOAD_VARINT32(b);
+	if (al != bl)
+		r = al - bl;
+	else
+		r = memcmp(a, b, al);
 
-		if (al != bl)
-			r = al - bl;
-		else
-			r = memcmp(a, b, al);
-	}
 	return r;
 }
 
@@ -84,7 +77,7 @@ static inline int lstrcmp(void *a, void *b)
 #define mh_name _lstr
 #define mh_key_t lstr
 #define mh_val_t ptr_t
-#define mh_hash(key) ({ void *_k = (key); unsigned l = LOAD_VARINT32(_k); MurmurHash2(_k, l, 13); })
+#define mh_hash(key) ({ const void *_k = (const void *)(key); int l = LOAD_VARINT32(_k); MurmurHash2(_k, l, 13); })
 #define mh_eq(a, b) ({ lstrcmp(*(mh_key_t *)((a) + sizeof(mh_val_t)), (b)) == 0; })
 #include <mhash.h>
 

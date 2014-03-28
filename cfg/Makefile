@@ -2,8 +2,10 @@ obj += cfg/warning.o
 obj += cfg/prscfg.o
 obj += cfg/octopus.o
 
-disable-warns-obj += cfg/octopus.o
-disable-warns-obj += cfg/prscfg.o
+no-extra-warns += cfg/octopus.o
+no-extra-warns += cfg/prscfg.o
+# no warns at all: it complains even with -Wall
+cfg/octopus.o: XCFLAGS := $(filter-out -W%,$(XCFLAGS))
 
 cfg/warning.o: cfg/prscfg.h
 

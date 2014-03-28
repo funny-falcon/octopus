@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2010, 2011, 2012 Mail.RU
- * Copyright (C) 2010, 2011, 2012 Yuriy Vostrikov
+ * Copyright (C) 2010, 2011, 2012, 2013 Mail.RU
+ * Copyright (C) 2010, 2011, 2012, 2013 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -96,6 +96,8 @@ void *xrealloc(void *ptr, size_t size);
 #  define oct_cold
 #endif
 
+#define _unused_ __attribute__((__unused__))
+
 #if HAVE__BUILTIN_EXPECT
 #  define likely(x)    __builtin_expect((x),1)
 #  define unlikely(x)  __builtin_expect((x),0)
@@ -175,6 +177,7 @@ void __gcov_flush();
 extern pid_t master_pid;
 pid_t tnt_fork();
 void keepalive(void);
+void keepalive_read(void);
 
 extern volatile int gdb_wait_lock;
 void wait_gdb(void);

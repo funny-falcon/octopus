@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2011, 2012 Mail.RU
- * Copyright (C) 2011, 2012 Yuriy Vostrikov
+ * Copyright (C) 2011, 2012, 2013, 2014 Mail.RU
+ * Copyright (C) 2011, 2012, 2013, 2014 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -49,10 +49,22 @@ static inline struct iproto_retcode *iproto_retcode(const struct tbuf *t)
 	return (struct iproto_retcode *)t->ptr;
 }
 
-struct tbuf *iproto_parse(struct tbuf *in);
+static inline struct iproto *iproto_parse(struct tbuf *t)
+{
+	if (tbuf_len(t) < sizeof(struct iproto) ||
+	    tbuf_len(t) < sizeof(struct iproto) + iproto(t)->data_len)
+		return NULL;
+
+	struct iproto *ret = iproto(t);
+	tbuf_ltrim(t, sizeof(struct iproto) + ret->data_len);
+	return ret;
+}
+
 
 struct netmsg_head;
 struct iproto_retcode * iproto_reply(struct netmsg_head *h, const struct iproto *request);
+struct iproto_retcode * iproto_reply_start(struct netmsg_head *h, const struct iproto *request);
+void iproto_reply_fixup(struct netmsg_head *h, struct iproto_retcode *reply);
 void iproto_error(struct netmsg_head *h, const struct iproto *request, u32 ret_code, const char *err);
 
 void iproto_worker(va_list ap);
@@ -71,6 +83,8 @@ SLIST_HEAD(iproto_group, iproto_peer);
 
 int init_iproto_peer(struct iproto_peer *p, int id, const char *name, const char *addr);
 
+void iproto_ping(struct netmsg_head *h, struct iproto *r, struct conn *c);
+
 void
 service_register_iproto_stream(struct service *s, u32 cmd,
 			       void (*cb)(struct netmsg_head *, struct iproto *, struct conn *),
@@ -80,28 +94,30 @@ service_register_iproto_block(struct service *s, u32 cmd,
 			      void (*cb)(struct iproto *, struct conn *),
 			      int flags);
 
-u32 iproto_next_sync();
-void iproto_rendevouz(va_list ap);
-void iproto_reply_reader(va_list ap);
-void req_collect_reply(struct conn *c, struct iproto *msg);
-void iproto_pinger(va_list ap);
-
 struct iproto_req {
+	struct iproto header;
 	const char *name;
-	u32 sync;
-	int count, quorum;
+	u16 count, quorum;
 	ev_timer timer;
 	struct fiber *waiter;
 	ev_tstamp sent, timeout, closed;
-	struct iproto *header, **reply;
-	const void *data;
-	size_t data_len;
+	struct iproto **reply;
 };
 
-void broadcast(struct iproto_group *group, struct iproto_req *req);
-struct iproto_req *req_make(const char *name, int quorum, ev_tstamp timeout,
-			    struct iproto *header, const void *date, size_t data_len);
-void req_release(struct iproto_req *r);
+
+u32 iproto_next_sync();
+void iproto_reply_reader(va_list ap);
+void iproto_collect_reply(struct conn *c, struct iproto *msg);
+void iproto_rendevouz(va_list ap);
+void iproto_pinger(va_list ap);
+
+struct iproto_req *iproto_req_make(u16 msg_code, ev_tstamp timeout, const char *name);
+void iproto_req_release(struct iproto_req *r);
+void iproto_send(struct iproto_peer *peer, struct iproto_req *r,
+		 const struct iovec *iov, int iovcnt);
+void iproto_broadcast(struct iproto_group *group, int quorum, struct iproto_req *r,
+		      const struct iovec *iov, int iovcnt);
+
 #define FOREACH_REPLY(req, var) for (struct iproto **var##p = (req)->reply, *var = *var##p; \
 				     var; var  = *++var##p)
 
@@ -122,18 +138,21 @@ void req_release(struct iproto_req *r);
 - (u32)code;
 @end
 
-#define iproto_raise(err, msg)						\
-	@throw [[IProtoError palloc] init_code:(err)			\
-					  line:__LINE__			\
-					  file:__FILE__			\
-				     backtrace:NULL			\
-					reason:(msg)]
-#define iproto_raise_fmt(err, fmt, ...)					\
-	@throw [[IProtoError palloc] init_code:(err)			\
-					  line:__LINE__			\
-					  file:__FILE__			\
-				     backtrace:NULL			\
-					format:(fmt), __VA_ARGS__]
+#define iproto_exc(err, msg)						\
+	[[IProtoError palloc] init_code:(err)				\
+				   line:__LINE__			\
+				   file:__FILE__			\
+			      backtrace:NULL				\
+				 reason:(msg)]
+#define iproto_fexc(err, fmt, ...)					\
+	[[IProtoError palloc] init_code:(err)				\
+				   line:__LINE__			\
+				   file:__FILE__			\
+			      backtrace:NULL				\
+				 format:(fmt), __VA_ARGS__]
+
+#define iproto_raise(...) @throw iproto_exc(__VA_ARGS__)
+#define iproto_raise_fmt(...) @throw iproto_fexc(__VA_ARGS__)
 
 enum error_codes ENUM_INITIALIZER(ERROR_CODES);
 

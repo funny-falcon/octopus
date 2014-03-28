@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2010, 2011, 2012 Mail.RU
- * Copyright (C) 2010, 2011, 2012 Yuriy Vostrikov
+ * Copyright (C) 2010, 2011, 2012, 2013, 2014 Mail.RU
+ * Copyright (C) 2010, 2011, 2012, 2013, 2014 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -39,6 +39,7 @@ struct namespace;
 struct box_tuple;
 struct index;
 
+/* also defined by box.lua */
 #define MAX_IDX 10
 struct object_space {
 	int n;
@@ -48,7 +49,7 @@ struct object_space {
 };
 
 extern struct object_space *object_space_registry;
-extern const int object_space_count;
+extern const int object_space_count, object_space_max_idx;
 
 enum object_type {
 	BOX_TUPLE = 1
@@ -69,9 +70,23 @@ box_tuple(struct tnt_object *obj)
 	return (struct box_tuple *)obj->data;
 }
 
-@interface BoxTxn : Object <Txn> {
-@public
-	struct row_v12 wal;
+struct box_snap_row {
+	u32 object_space;
+	u32 tuple_size;
+	u32 data_size;
+	u8 data[];
+} __attribute((packed));
+
+static inline struct box_snap_row *
+box_snap_row(const struct tbuf *t)
+{
+	return (struct box_snap_row *)t->ptr;
+}
+
+extern struct dtor_conf box_tuple_dtor;
+struct index_conf * cfg_box2index_conf(struct octopus_cfg_object_space_index *c);
+
+struct box_txn {
 	u16 op;
 	u32 flags;
 
@@ -80,17 +95,16 @@ box_tuple(struct tnt_object *obj)
 
 	struct tnt_object *old_obj, *obj;
 	struct tnt_object *ref[2];
+	u16 index_eqmask;
 	u32 obj_affected;
 
 	bool closed;
-
-	const void *body;
-	u32 body_len;
 };
 
-- (void) prepare:(u16)op_ data:(const void *)data len:(u32)len;
-
-@end
+void box_prepare(struct box_txn *txn, struct tbuf *data);
+void box_commit(struct box_txn *txn);
+void box_rollback(struct box_txn *txn);
+void box_cleanup(struct box_txn *txn);
 
 #define BOX_RETURN_TUPLE 1
 #define BOX_ADD 2
@@ -128,6 +142,7 @@ box_tuple(struct tnt_object *obj)
 	_(SELECT_KEYS, 99)
 
 enum messages ENUM_INITIALIZER(MESSAGES);
+extern char * const box_ops[];
 
 @interface Recovery (Box)
 @end
@@ -136,9 +151,8 @@ extern Recovery *recovery;
 void *next_field(void *f);
 void append_field(struct tbuf *b, void *f);
 void *tuple_field(struct box_tuple *tuple, size_t i);
+ssize_t tuple_bsize(u32 cardinality, const void *data, u32 max_len);
 
-void box_bound_to_primary(int fd);
-void memcached_init(void);
-
-extern LStringHash *memcached_index;
+int box_cat_scn(i64 stop_scn);
+int box_cat(const char *filename);
 #endif

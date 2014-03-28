@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2010, 2011, 2012 Mail.RU
- * Copyright (C) 2010, 2011, 2012 Yuriy Vostrikov
+ * Copyright (C) 2010, 2011, 2012, 2013, 2014 Mail.RU
+ * Copyright (C) 2010, 2011, 2012, 2013, 2014 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -62,6 +62,7 @@
 #if HAVE_SYS_PRCTL_H
 # include <sys/prctl.h>
 #endif
+#include <sys/utsname.h>
 
 #define DEFAULT_CFG_FILENAME "octopus.cfg"
 const char *cfg_filename = DEFAULT_CFG_FILENAME;
@@ -75,8 +76,6 @@ lua_State *root_L;
 char cfg_err_buf[1024], *cfg_err;
 int cfg_err_len, cfg_err_offt;
 struct octopus_cfg cfg;
-char *custom_proc_title;
-
 
 ev_io keepalive_ev = { .coro = 0 };
 Recovery *recovery;
@@ -84,6 +83,21 @@ int keepalive_pipe[2];
 
 extern int daemonize(int nochdir, int noclose);
 void out_warning(int v, char *format, ...);
+
+static int io_collect_zeroers = 0;
+void
+zero_io_collect_interval()
+{
+	if (++io_collect_zeroers == 1)
+		ev_set_io_collect_interval(0.0);
+}
+
+void
+unzero_io_collect_interval()
+{
+	if (--io_collect_zeroers == 0)
+		ev_set_io_collect_interval(cfg.io_collect_interval);
+}
 
 static void
 reset_cfg_err()
@@ -120,9 +134,6 @@ load_cfg(struct octopus_cfg *conf, i32 check_rdonly)
 
 	if (n_accepted == 0 || n_skipped != 0)
 		return -1;
-
-	if (net_fixup_addr(&conf->admin_addr, conf->admin_port) < 0)
-		out_warning(0, "Option 'admin_addr' is overridden by 'admin_port'");
 
 	foreach_module (m) {
 		if (m->check_config)
@@ -197,6 +208,60 @@ module(const char *name)
 }
 
 void
+module_init(struct tnt_module *mod)
+{
+	int i;
+	if (mod->_state == TNT_MODULE_INITED)
+		return;
+
+	if (mod->_state == TNT_MODULE_INPROGRESS) {
+		say_error("Circular module dependency detected on module %s", mod->name);
+	}
+
+	mod->_state = TNT_MODULE_INPROGRESS;
+
+	if (mod->name) {
+		foreach_module (m) {
+			if (!m->init_before)
+				continue;
+			for (i = 0; (*m->init_before)[i]; i++) {
+				if (strcmp((*m->init_before)[i], mod->name) == 0) {
+					module_init(m);
+				}
+			}
+		}
+	}
+
+	if (mod->depend_on) {
+		for (i = 0; (*mod->depend_on)[i]; i++) {
+			struct tnt_module *dep = NULL;
+			/* if dependency is "?module_name"
+			 * then "module_name" is not critical dependency */
+			if ((*mod->depend_on)[i][0] == '?') {
+				dep = module((*mod->depend_on)[i] + 1);
+				if (!dep) {
+					say_warn("dependency module '%s' not registered",
+						       	(*mod->depend_on)[i]+1);
+					continue;
+				}
+			} else {
+				dep = module((*mod->depend_on)[i]);
+				if (!dep) {
+					panic("dependency module '%s' not registered",
+						       	(*mod->depend_on)[i]);
+				}
+			}
+			module_init(dep);
+		}
+	}
+
+	if (mod->init)
+		mod->init();
+
+	mod->_state = TNT_MODULE_INITED;
+}
+
+void
 register_module_(struct tnt_module *m)
 {
         m->next = modules_head;
@@ -256,7 +321,7 @@ tnt_uptime(void)
 static void
 save_snapshot(void *ev __attribute__((unused)), int events __attribute__((unused)))
 {
-	[recovery snapshot:false];
+	[[recovery snap_writer] snapshot:false];
 }
 #endif
 
@@ -365,34 +430,11 @@ luaT_error(struct lua_State *L)
 		err = lua_tostring(L, -1);
 
 	/* FIXME: use native exceptions ? */
-	iproto_raise_fmt(ERR_CODE_UNKNOWN_ERROR, "%s", err);
+	@throw [[Error palloc] init:err];
 }
 
 
-static int
-luaT_static_module(lua_State *L)
-{
-    const char *_name = luaL_checkstring(L, 1);
-    char *name = alloca(strlen(_name) + 1);
-    strcpy(name, _name);
-
-    for (char *p = name; *p; p++)
-	    if (*p == '.')
-		    *p = '_';
-
-    for (struct lua_src *s = lua_src; s->name; s++)
-	    if (strcmp(name, s->name) == 0) {
-		    if (luaL_loadbuffer(L, s->start, s->size, name) != 0)
-			    panic("luaL_loadbuffer: %s", lua_tostring(L, 2));
-		    return 1;
-	    }
-
-
-    lua_pushnil(L);
-    return 1;
-}
-
-static int
+static int /* FIXME: FFFI! */
 luaT_os_ctime(lua_State *L)
 {
 	const char *filename = luaL_checkstring(L, 1);
@@ -400,9 +442,35 @@ luaT_os_ctime(lua_State *L)
 
 	if (stat(filename, &buf) < 0)
 		luaL_error(L, "stat(`%s'): %s", filename, strerror(errno));
-	lua_pushinteger(L, buf.st_ctime);
+	lua_pushnumber(L, buf.st_ctime + (lua_Number)buf.st_ctim.tv_nsec / 1.0e9);
 	return 1;
 }
+
+int
+luaT_traceback(lua_State *L)
+{
+	if (!lua_isstring(L, 1)) { /* Non-string error object? Try metamethod. */
+		if (lua_isnoneornil(L, 1) ||
+				!luaL_callmeta(L, 1, "__tostring") ||
+				!lua_isstring(L, -1)) {
+			lua_settop(L, 1);
+			lua_getglobal(L, "tostring");
+			lua_pushvalue(L, -2);
+			lua_call(L, 1, 0);
+		}
+		lua_remove(L, 1);  /* Replace object by result of __tostring metamethod. */
+	}
+	luaL_traceback(L, L, lua_tostring(L, 1), 1);
+	return 1;
+}
+
+static int luaT_traceback_i = 0;
+void
+luaT_pushtraceback(lua_State *L)
+{
+	lua_rawgeti(L, LUA_REGISTRYINDEX, luaT_traceback_i);
+}
+
 
 static void
 luaT_init()
@@ -416,13 +484,6 @@ luaT_init()
 	luaL_openlibs(L);
 	lua_register(L, "print", luaT_print);
 
-	lua_getglobal(L, "package");
-	lua_getfield(L, -1, "loaders");
-	lua_pushinteger(L, lua_objlen(L, -1));
-	lua_pushcfunction(L, luaT_static_module);
-	lua_settable(L, -3);
-	lua_pop(L, 2);
-
 	luaT_openfiber(L);
 
         lua_getglobal(L, "package");
@@ -435,23 +496,16 @@ luaT_init()
 	lua_setfield(L, -2, "ctime");
 	lua_pop(L, 1);
 
+#ifdef OCT_OBJECT
 	luaT_objinit(L);
-	luaT_indexinit(L);
-
-        lua_getglobal(L, "require");
-        lua_pushliteral(L, "prelude");
-	if (lua_pcall(L, 1, 0, 0))
+#endif
+	lua_pushcfunction(L, luaT_traceback);
+	lua_getglobal(L, "require");
+	lua_pushliteral(L, "prelude");
+	if (lua_pcall(L, 1, 0, -3))
 		panic("lua_pcall() failed: %s", lua_tostring(L, -1));
 
-	/* autoload bundled graphite module */
-	for (struct lua_src *s = lua_src; s->name; s++) {
-		if (strcmp("graphite", s->name) == 0) {
-			lua_getglobal(L, "require");
-			lua_pushliteral(L, "graphite");
-			lua_pcall(L, 1, 0, 0);
-			break;
-		}
-	}
+	luaT_traceback_i = lua_ref(L, LUA_REGISTRYINDEX);
 
 	lua_atpanic(L, luaT_error);
 }
@@ -483,22 +537,41 @@ int
 luaT_require(const char *modname)
 {
 	struct lua_State *L = fiber->L;
+	lua_pushcfunction(L, luaT_traceback);
 	lua_getglobal(L, "require");
 	lua_pushstring(L, modname);
-	if (!lua_pcall(L, 1, 0, 0)) {
+	if (!lua_pcall(L, 1, 0, -3)) {
 		say_info("Lua module '%s' loaded", modname);
+		lua_pop(L, 1);
 		return 1;
 	} else {
 		const char *err = lua_tostring(L, -1);
 		char buf[64];
+		int ret = 0;
 		snprintf(buf, sizeof(buf), "module '%s' not found", modname);
-		if (strstr(err, buf) != NULL) {
-			lua_pop(L, 1);
-			return 0;
+		if (strstr(err, buf) == NULL) {
+			say_debug("luaT_require(%s): failed with `%s'", modname, err);
+			ret = -1;
 		}
-		say_debug("luaT_require(%s): failed with `%s'", modname, err);
-		return -1;
+		lua_remove(L, -2);
+		return ret;
 	}
+}
+
+void
+luaT_require_or_panic(const char *modname, bool panic_on_missing, const char *error_format)
+{
+	int ret = luaT_require(modname);
+	if (ret == 1)
+		return;
+	if (ret == 0 && !panic_on_missing) {
+		lua_pop(fiber->L, 1);
+		return;
+	}
+	if (error_format == NULL) {
+		error_format = "unable to load `%s' lua module: %s";
+	}
+	panic(error_format, modname, lua_tostring(fiber->L, -1));
 }
 
 int
@@ -514,18 +587,12 @@ luaT_pushptr(struct lua_State *L, void *p)
 }
 
 
-#ifdef STORAGE
-static void
-keepalive_read(ev_io *e, int events __attribute__((unused)))
+#if defined(STORAGE) || defined(FEEDER)
+void
+_keepalive_read(ev_io *e, int events __attribute__((unused)))
 {
-	char buf[16];
-	ssize_t r = read(e->fd, buf, sizeof(buf));
-	if (r > 0)
-		return;
-	if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
-		return;
-
-	panic("read from keepalive_pipe failed");
+	assert(e != NULL && e->fd == keepalive_pipe[0]);
+	keepalive_read();
 }
 
 static void
@@ -539,16 +606,20 @@ ev_panic(const char *msg)
 static int
 octopus(int argc, char **argv)
 {
-#ifdef STORAGE
+#if defined(STORAGE) || defined(FEEDER)
 	const char *cat_filename = NULL;
 #endif
 	const char *cfg_paramname = NULL;
 
 	master_pid = getpid();
 	srand(master_pid);
-	palloc_init();
 #ifdef HAVE_LIBELF
-	load_symbols(argv[0]);
+	if (access(argv[0], R_OK) == 0 && strchr(argv[0], '/') != NULL)
+		load_symbols(argv[0]);
+	else if (access("/proc/self/exe", R_OK) == 0)
+		load_symbols("/proc/self/exe");
+	else
+		say_warn("unable to load symbols");
 #endif
 	argv = init_set_proc_title(argc, argv);
 
@@ -562,9 +633,11 @@ octopus(int argc, char **argv)
 			   gopt_option('c', GOPT_ARG, gopt_shorts('c'),
 				       gopt_longs("config"),
 				       "=FILE", "path to configuration file (default: " DEFAULT_CFG_FILENAME ")"),
-#ifdef STORAGE
+#if defined(STORAGE) || defined(FEEDER)
 			   gopt_option('C', GOPT_ARG, gopt_shorts(0), gopt_longs("cat"),
 				       "=FILE|SCN", "cat xlog to stdout in readable format and exit"),
+#endif
+#ifdef STORAGE
 			   gopt_option('F', GOPT_ARG, gopt_shorts(0), gopt_longs("fold"),
 				       "=SCN", "calculate CRC32C of storage at given SCN and exit"),
 			   gopt_option('i', 0, gopt_shorts('i'),
@@ -605,11 +678,15 @@ octopus(int argc, char **argv)
 		say_list_sources();
 		return 0;
 	}
-#ifdef STORAGE
+#if defined(STORAGE) || defined(FEEDER)
 	if (gopt_arg(opt, 'C', &cat_filename)) {
 		salloc_init(0, 0, 0);
 		fiber_init();
 		set_proc_title("cat %s", cat_filename);
+
+		gopt_arg(opt, 'c', &cfg_filename);
+		if (fill_default_octopus_cfg(&cfg) != 0 || load_cfg(&cfg, 0) != 0)
+			panic("can't load config: %s", cfg_err);
 
 		if (strchr(cat_filename, '.') || strchr(cat_filename, '/')) {
 			if (access(cat_filename, R_OK) == -1) {
@@ -628,9 +705,6 @@ octopus(int argc, char **argv)
 				exit(EX_USAGE);
 			}
 
-			gopt_arg(opt, 'c', &cfg_filename);
-			if (fill_default_octopus_cfg(&cfg) != 0 || load_cfg(&cfg, 0) != 0)
-				panic("can't load config: %s", cfg_err);
 			if (cfg.work_dir != NULL && chdir(cfg.work_dir) == -1)
 				say_syserror("can't chdir to `%s'", cfg.work_dir);
 
@@ -639,7 +713,9 @@ octopus(int argc, char **argv)
 					return m->cat_scn(stop_scn);
 		}
 	}
+#endif
 
+#ifdef STORAGE
 	const char *opt_text;
 	if (gopt_arg(opt, 'F', &opt_text))
 		fold_scn = atol(opt_text);
@@ -718,8 +794,11 @@ octopus(int argc, char **argv)
 	if (cfg.username != NULL) {
 		if (getuid() == 0 || geteuid() == 0) {
 			struct passwd *pw;
+			errno = 0;
 			if ((pw = getpwnam(cfg.username)) == 0) {
-				say_syserror("getpwnam: %s", cfg.username);
+				if (errno == 0)
+					errno = ENOENT;
+				say_syserror("getpwnam(\"%s\")", cfg.username);
 				exit(EX_NOUSER);
 			}
 			if (setgid(pw->pw_gid) < 0 || setuid(pw->pw_uid) < 0 || seteuid(pw->pw_uid)) {
@@ -741,16 +820,8 @@ octopus(int argc, char **argv)
 	}
 
 	if (fold_scn) {
-		custom_proc_title = "fold";
+		cfg.custom_proc_title = "fold";
 	} else {
-		if (cfg.custom_proc_title == NULL)
-			custom_proc_title = "";
-		else {
-			custom_proc_title = xcalloc(strlen(cfg.custom_proc_title) + 2, 1);
-			strcat(custom_proc_title, "@");
-			strcat(custom_proc_title, cfg.custom_proc_title);
-		}
-
 		if (gopt(opt, 'D')) {
 			if (daemonize(1, 0) < 0)
 				panic("unable to daemonize");
@@ -785,8 +856,8 @@ octopus(int argc, char **argv)
 			exit(EX_USAGE);
 		}
 
-		module(NULL)->init();
-		exit([recovery snapshot_initial]);
+		module_init(module(NULL));
+		exit([recovery write_initial_state]);
 	}
 #endif
 
@@ -795,9 +866,18 @@ octopus(int argc, char **argv)
 	fiber_init();
 	luaT_init();
 	signal_init();
-	module(NULL)->init();
-#elif defined(STORAGE)
+	module_init(module(NULL));
+#elif defined(STORAGE) || defined(FEEDER)
 	say_info("octopus version: %s", octopus_version());
+	say_info("%s", OCT_BUILD_INFO);
+	struct utsname utsn;
+	if (uname(&utsn) == 0)
+		say_info("running on %s %s %s %s",
+			 utsn.nodename, utsn.sysname,
+			 utsn.release, utsn.machine);
+	else
+		say_syserror("uname");
+
 	signal_init();
 	ev_set_syserr_cb(ev_panic);
 	ev_default_loop(ev_recommended_backends() | EVFLAG_SIGNALFD);
@@ -812,7 +892,7 @@ octopus(int argc, char **argv)
 		default:                    evb = "unknown";
 	}
 
-	say_info("ev_loop initialized using '%s' backend, libev version is %d.%d", 
+	say_info("ev_loop initialized using '%s' backend, libev version is %d.%d",
 		 evb, ev_version_major(), ev_version_minor());
 
 	ev_timer coredump_timer = { .coro = 0 };
@@ -828,15 +908,24 @@ octopus(int argc, char **argv)
 		exit(1);
 	}
 
-	ev_io_init(&keepalive_ev, keepalive_read, keepalive_pipe[0], EV_READ);
+	ev_io_init(&keepalive_ev, _keepalive_read, keepalive_pipe[0], EV_READ);
 	ev_io_start(&keepalive_ev);
 
 	fiber_init(); /* must be initialized before Lua */
 	luaT_init();
 
-	if (module("feeder") && fold_scn == 0)
-		module("feeder")->init();
+#ifdef FEEDER
+	cfg.wal_feeder_fork_before_init = 0;
+	assert(module("feeder"));
+#endif
+	if (module("feeder") && fold_scn == 0) {
+		/* this either gets overriden it feeder don't fork
+		   or stays forever in the child */
+		current_module = module("feeder");
+		module_init(current_module);
+	}
 
+#ifdef STORAGE
 	ev_signal ev_sig = { .coro = 0 };
 	ev_signal_init(&ev_sig, (void *)save_snapshot, SIGUSR1);
 	ev_signal_start(&ev_sig);
@@ -847,9 +936,15 @@ octopus(int argc, char **argv)
 
 	salloc_init(fixed_arena, cfg.slab_alloc_minimal, cfg.slab_alloc_factor);
 
+	/* try autoload bundled graphite module */
+	luaT_require_or_panic("graphite", false, NULL);
 	stat_init();
+
 	@try {
-		module(NULL)->init();
+		current_module = module(NULL); /* primary */
+		module_init(current_module);
+		foreach_module(m)
+			module_init(m);
 	}
 	@catch (id e) {
 		if ([e respondsTo:@selector(code)] && [e code] == ERR_CODE_MEMORY_ISSUE) {
@@ -858,11 +953,9 @@ octopus(int argc, char **argv)
 		}
 		@throw e;
 	}
-	admin_init();
 
 	/* run Lua init _after_ module init */
-	if (luaT_require("init") == -1)
-		panic("unable to load `init' lua module: %s", lua_tostring(fiber->L, -1));
+	luaT_require_or_panic("init", false, NULL);
 
 	prelease(fiber->pool);
 	say_debug("entering event loop");
@@ -872,8 +965,9 @@ octopus(int argc, char **argv)
 	ev_run(0);
 	ev_loop_destroy();
 	say_debug("exiting loop");
+#endif
 #else
-#error UTILITY or STORAGE must be defined
+#error UTILITY or STORAGE or FEEDER must be defined
 #endif
 	return 0;
 }

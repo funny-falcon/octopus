@@ -1,11 +1,9 @@
 include $(VPATH)/src/index/Makefile
 
 obj += src/objc.o
-obj += src/tnt_obj.o
 obj += src/net_io.o
 obj += src/coro.o
 obj += src/fiber.o
-obj += src/iproto.o
 
 obj += src/palloc.o
 obj += src/pickle.o
@@ -29,30 +27,25 @@ ifeq (1,$(HAVE_RAGEL))
 	dist += src/admin.m
 endif
 
-$(obj): CFLAGS += -DOCTOPUS
+$(obj): XCFLAGS += -DOCTOPUS
 
 src/octopus.o: octopus_version.h
-src/octopus.o: CFLAGS += -DPRIMARY_MOD='"$(primary_module)"' -D$(binary_type)
+src/octopus.o: XCFLAGS += -DPRIMARY_MOD='"$(primary_module)"' -D$(binary_type)
 ifeq ($(binary_type),)
   $(error binary_type must be defined)
 endif
 
 # some modules might be built without paxos
 ifneq ($(findstring src/paxos.o,$(obj)),)
-  src/log_io_recovery.o: CFLAGS += -DPAXOS
+  src/log_io_recovery.o: XCFLAGS += -DPAXOS
 endif
 
-disable-warns-obj += src/octopus_ev.o
-src/octopus_ev.o: CFLAGS += -U_FORTIFY_SOURCE
-ifeq (1,$(HAVE_CC_FLAG_W_NO_COMMENT))
-  src/octopus_ev.o: CFLAGS += -Wno-comment
-endif
-ifeq (1,$(HAVE_CC_FLAG_W_NO_UNUSED_VALUE))
-  src/octopus_ev.o: CFLAGS += -Wno-unused-value
-endif
+# no warns at all: it complains even with -Wall
+no-extra-warns += src/octopus_ev.o
+src/octopus_ev.o: XCFLAGS := -U_FORTIFY_SOURCE $(filter-out -W%,$(CFLAGS_EXTRA))
 
 ifneq (,$(TRACE))
 	obj += src/trace.o
-	$(TRACE): CFLAGS += -finstrument-functions
-	LDFLAGS += -Wl,-Map=octopus.map
+	$(TRACE): XCFLAGS += -finstrument-functions
+	XLDFLAGS += -Wl,-Map=octopus.map
 endif

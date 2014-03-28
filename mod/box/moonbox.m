@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2010, 2011, 2012 Mail.RU
- * Copyright (C) 2010, 2011, 2012 Yuriy Vostrikov
+ * Copyright (C) 2010, 2011, 2012, 2013, 2014 Mail.RU
+ * Copyright (C) 2010, 2011, 2012, 2013, 2014 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -40,199 +40,56 @@
 #include <third_party/luajit/src/lua.h>
 #include <third_party/luajit/src/lualib.h>
 #include <third_party/luajit/src/lauxlib.h>
-
+#include <third_party/luajit/src/lj_obj.h> /* for LJ_TCDATA */
 #import <mod/box/box.h>
 #import <mod/box/moonbox.h>
-
-
-static int
-tuple_len_(struct lua_State *L)
-{
-	struct tnt_object *obj = *(void **)luaL_checkudata(L, 1, objectlib_name);
-	struct box_tuple *tuple = box_tuple(obj);
-	lua_pushnumber(L, tuple->cardinality);
-	return 1;
-}
-
-static int
-tuple_index_(struct lua_State *L)
-{
-	struct tnt_object *obj = *(void **)luaL_checkudata(L, 1, objectlib_name);
-	struct box_tuple *tuple = box_tuple(obj);
-
-	int i = luaL_checkint(L, 2);
-	if (i >= tuple->cardinality) {
-		lua_pushliteral(L, "index too small");
-		lua_error(L);
-	}
-
-	void *field = tuple_field(tuple, i);
-	u32 len = LOAD_VARINT32(field);
-	lua_pushlstring(L, field, len);
-	return 1;
-}
-
-static const struct luaL_reg object_mt [] = {
-	{"__len", tuple_len_},
-	{"__index", tuple_index_},
-	{NULL, NULL}
-};
-
-#if 0
-struct box_tuple *
-luaT_toboxtuple(struct lua_State *L, int table)
-{
-	luaL_checktype(L, table, LUA_TTABLE);
-
-	u32 bsize = 0, cardinality = lua_objlen(L, table);
-
-	for (int i = 0; i < cardinality; i++) {
-		lua_rawgeti(L, table, i + 1);
-		u32 len = lua_objlen(L, -1);
-		lua_pop(L, 1);
-		bsize += varint32_sizeof(len) + len;
-	}
-
-	struct box_tuple *tuple = tuple_alloc(bsize);
-	tuple->cardinality = cardinality;
-
-	u8 *p = tuple->data;
-	for (int i = 0; i < cardinality; i++) {
-		lua_rawgeti(L, table, i + 1);
-		size_t len;
-		const char *str = lua_tolstring(L, -1, &len);
-		lua_pop(L, 1);
-
-		p = save_varint32(p, len);
-		memcpy(p, str, len);
-		p += len;
-	}
-
-	return tuple;
-}
-#endif
-
 
 static int
 luaT_box_dispatch(struct lua_State *L)
 {
-	u16 op = luaL_checkinteger(L, 1);
 	size_t len;
-	const char *req = luaL_checklstring(L, 2, &len);
-	struct BoxTxn *txn = [BoxTxn palloc];
+	const char *req;
+	struct box_txn txn = { .op = luaL_checkinteger(L, 1) };
 
+	if (lua_type(L, 2) == ~LJ_TCDATA) {
+		char * const *p = lua_topointer(L, 2);
+		req = *p;
+		len = luaL_checkinteger(L, 3);
+	} else {
+		req = luaL_checklstring(L, 2, &len);
+	}
 	@try {
 		[recovery check_replica];
 
-		[txn prepare:op data:req len:len];
-		if ([recovery submit:txn] != 1)
+		box_prepare(&txn, &TBUF(req, len, NULL));
+		if ([recovery submit:req len:len tag:txn.op<<5|TAG_WAL] != 1)
 			iproto_raise(ERR_CODE_UNKNOWN_ERROR, "unable write row");
-		[txn commit];
+		box_commit(&txn);
 
-		if (txn->obj != NULL) {
-			luaT_pushobject(L, txn->obj);
+		if (txn.obj != NULL) {
+			lua_pushlightuserdata(L, txn.obj);
 			return 1;
 		}
 	}
 	@catch (Error *e) {
-		[txn rollback];
+		box_rollback(&txn);
 		if ([e respondsTo:@selector(code)])
 			lua_pushfstring(L, "code:%d reason:%s", [(id)e code], e->reason);
 		else
 			lua_pushstring(L, e->reason);
 		lua_error(L);
 	}
+	@finally {
+		box_cleanup(&txn);
+	}
 	return 0;
 }
 
-static int
-luaT_box_index(struct lua_State *L)
-{
-	int n = luaL_checkinteger(L, 1);
-	int i = luaL_checkinteger(L, 2);
-	if (n < 0 || n >= object_space_count) {
-		lua_pushliteral(L, "bad object_space num");
-		lua_error(L);
-	}
-	if (i < 0 || i >= MAX_IDX) {
-		lua_pushliteral(L, "bad index num");
-		lua_error(L);
-	}
-
-	Index *index = object_space_registry[n].index[i];
-	if (!index)
-		return 0;
-	luaT_pushindex(L, index);
-	return 1;
-}
-
 static const struct luaL_reg boxlib [] = {
-	{"index", luaT_box_index},
-	{"dispatch", luaT_box_dispatch},
+	{"_dispatch", luaT_box_dispatch},
 	{NULL, NULL}
 };
 
-
-
-static int
-luaT_pushfield(struct lua_State *L)
-{
-	size_t len, flen;
-	const char *str = luaL_checklstring(L, 1, &len);
-	flen = len + varint32_sizeof(len);
-	u8 *dst;
-	/* FIXME: this will crash, given str is large enougth */
-	if (flen > 128)
-		dst = xmalloc(flen);
-	else
-		dst = alloca(flen);
-	u8 *tail = save_varint32(dst, len);
-	memcpy(tail, str, len);
-	lua_pushlstring(L, (char *)dst, flen);
-	if (flen > 128)
-		free(dst);
-	return 1;
-}
-
-static int
-luaT_pushvarint32(struct lua_State *L)
-{
-	u32 i = luaL_checkinteger(L, 1);
-	u8 buf[5], *end;
-	end = save_varint32(buf, i);
-	lua_pushlstring(L, (char *)buf, end - buf);
-	return 1;
-}
-
-static int
-luaT_pushu32(struct lua_State *L)
-{
-	u32 i = luaL_checkinteger(L, 1);
-	u8 *dst = alloca(sizeof(i));
-	memcpy(dst, &i, sizeof(i));
-	lua_pushlstring(L, (char *)dst, sizeof(i));
-	return 1;
-}
-
-static int
-luaT_pushu16(struct lua_State *L)
-{
-	u16 i = luaL_checkinteger(L, 1);
-	u8 *dst = alloca(sizeof(i));
-	memcpy(dst, &i, sizeof(i));
-	lua_pushlstring(L, (char *)dst, sizeof(i));
-	return 1;
-}
-
-static int
-luaT_pushu8(struct lua_State *L)
-{
-	u8 i = luaL_checkinteger(L, 1);
-	u8 *dst = alloca(sizeof(i));
-	memcpy(dst, &i, sizeof(i));
-	lua_pushlstring(L, (char *)dst, sizeof(i));
-	return 1;
-}
 
 void
 luaT_openbox(struct lua_State *L)
@@ -244,53 +101,20 @@ luaT_openbox(struct lua_State *L)
         lua_setfield(L, -2, "path");
         lua_pop(L, 1);
 
-	lua_getglobal(L, "string");
-	lua_pushcfunction(L, luaT_pushfield);
-	lua_setfield(L, -2, "tofield");
-	lua_pushcfunction(L, luaT_pushvarint32);
-	lua_setfield(L, -2, "tovarint32");
-	lua_pushcfunction(L, luaT_pushu32);
-	lua_setfield(L, -2, "tou32");
-	lua_pushcfunction(L, luaT_pushu16);
-	lua_setfield(L, -2, "tou16");
-	lua_pushcfunction(L, luaT_pushu8);
-	lua_setfield(L, -2, "tou8");
-	lua_pop(L, 1);
-
-	luaL_newmetatable(L, objectlib_name);
-	luaL_register(L, NULL, object_mt);
-	lua_pop(L, 1);
-
 	luaL_findtable(L, LUA_GLOBALSINDEX, "box", 0);
 	luaL_register(L, NULL, boxlib);
-
-	lua_createtable(L, 0, 0); /* namespace_registry */
-	for (uint32_t n = 0; n < object_space_count; ++n) {
-		if (!object_space_registry[n].enabled)
-			continue;
-
-		lua_createtable(L, 0, 0); /* namespace */
-
-		lua_pushliteral(L, "cardinality");
-		lua_pushinteger(L, object_space_registry[n].cardinality);
-		lua_rawset(L, -3); /* namespace.cardinality = cardinality */
-
-		lua_pushliteral(L, "n");
-		lua_pushinteger(L, n);
-		lua_rawset(L, -3); /* namespace.n = n */
-
-		lua_rawseti(L, -2, n); /* namespace_registry[n] = namespace */
-	}
-	lua_setfield(L, -2, "object_space");
 	lua_pop(L, 1);
 
+	luaT_pushtraceback(L);
 	lua_getglobal(L, "require");
         lua_pushliteral(L, "box_prelude");
-	if (lua_pcall(L, 1, 0, 0) != 0)
+	if (lua_pcall(L, 1, 0, -3) != 0)
 		panic("moonbox: %s", lua_tostring(L, -1));
+	lua_pop(L, 1);
 }
 
 
+static int box_entry_i = 0;
 void
 box_dispach_lua(struct conn *c, struct iproto *request)
 {
@@ -302,19 +126,31 @@ box_dispach_lua(struct conn *c, struct iproto *request)
 	void *fname = read_bytes(&data, flen);
 	u32 nargs = read_u32(&data);
 
-	if (luaT_find_proc(L, fname, flen) == 0) {
-		lua_pop(L, 1);
-		iproto_raise_fmt(ERR_CODE_ILLEGAL_PARAMS, "no such proc: %.*s", flen, fname);
-	}
+	luaT_pushtraceback(L);
+	int top = lua_gettop(L);
 
-	lua_pushlightuserdata(L, c);
-	lua_pushlightuserdata(L, request);
+	if (box_entry_i == 0) {
+		lua_getglobal(L, "box");
+		lua_getfield(L, -1, "entry");
+		lua_remove(L, -2);
+		box_entry_i = lua_ref(L, LUA_REGISTRYINDEX);
+	}
+	lua_rawgeti(L, LUA_REGISTRYINDEX, box_entry_i);
+
+	lua_pushlstring(L, fname, flen);
+	luaT_pushptr(L, c);
+	luaT_pushptr(L, request);
+
+	if (!lua_checkstack(L, nargs)) {
+		lua_settop(L, top-1);
+		iproto_raise(ERR_CODE_ILLEGAL_PARAMS, "too many args to exec_lua");
+	}
 
 	for (int i = 0; i < nargs; i++)
 		read_push_field(L, &data);
 
 	/* FIXME: switch to native exceptions ? */
-	if (lua_pcall(L, 2 + nargs, 0, 0)) {
+	if (lua_pcall(L, 3 + nargs, LUA_MULTRET, top)) {
 		IProtoError *err = [IProtoError palloc];
 		const char *reason = lua_tostring(L, -1);
 		int code = ERR_CODE_ILLEGAL_PARAMS;
@@ -329,9 +165,43 @@ box_dispach_lua(struct conn *c, struct iproto *request)
 
 		[err init_code:code line:__LINE__ file:__FILE__
 		     backtrace:NULL format:"%s", reason];
-		lua_settop(L, 0);
+		lua_settop(L, top-1);
 		@throw err;
 	}
+
+	int newtop = lua_gettop(L);
+	if (newtop != top) {
+		if (newtop != top + 3 && newtop != top + 2) {
+			IProtoError *err = [IProtoError palloc];
+			int code = ERR_CODE_ILLEGAL_PARAMS;
+			[err init_code:code line:__LINE__ file:__FILE__
+			     backtrace:NULL
+			     format:"illegal return from wrapped function %s", fname];
+			lua_settop(L, top-1);
+			@throw err;
+		}
+		struct netmsg_mark mark;
+		netmsg_getmark(&c->out_messages, &mark);
+		struct iproto_retcode *reply = iproto_reply_start(&c->out_messages, request);
+		reply->ret_code = lua_tointeger(L, top + 2);
+		if (newtop == top + 3 && !lua_isnil(L, top + 3)) {
+			lua_remove(L, top + 2);
+			luaT_pushptr(L, c);
+			if (lua_pcall(L, 2, 0, top)) {
+				IProtoError *err = [IProtoError palloc];
+				const char *reason = lua_tostring(L, -1);
+				int code = ERR_CODE_ILLEGAL_PARAMS;
+				netmsg_rewind(&c->out_messages, &mark);
+
+				[err init_code:code line:__LINE__ file:__FILE__
+				     backtrace:NULL format:"%s", reason];
+				lua_settop(L, top-1);
+				@throw err;
+			}
+		}
+		iproto_reply_fixup(&c->out_messages, reply);
+	}
+	lua_settop(L, top-1);
 }
 
 register_source();

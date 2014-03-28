@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2012 Mail.RU
- * Copyright (C) 2012 Yuriy Vostrikov
+ * Copyright (C) 2012, 2013, 2014 Mail.RU
+ * Copyright (C) 2012, 2013, 2014 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -40,6 +40,100 @@
 #include <sysexits.h>
 #include <sys/socket.h>
 
+@interface WALDiskWriter: Object {
+@public
+	i64 lsn;
+	XLog *current_wal;	/* the WAL we'r currently reading/writing from/to */
+	XLog *wal_to_close;
+	XLogDir *wal_dir;
+}
+- (id) init:(XLogDir *)wal_dir_;
+@end
+
+
+@implementation WALDiskWriter
+
+- (id)
+init:(XLogDir *)wal_dir_
+{
+	wal_dir = wal_dir_;
+	return self;
+}
+
+- (const struct row_v12 *)
+append_row:(struct row_v12 *)row data:(const void *)data
+{
+	row->tm = ev_now();
+	return [current_wal append_row:row data:data];
+}
+
+- (int)
+prepare_write:(i64)scn_
+{
+	if (current_wal == nil)
+		current_wal = [wal_dir open_for_write:lsn + 1 scn:scn_];
+
+        if (current_wal == nil) {
+                say_error("can't open wal");
+                return -1;
+        }
+
+	return 0;
+}
+
+- (i64)
+confirm_write
+{
+	static ev_tstamp last_flush;
+
+	if (current_wal != nil) {
+		i64 confirmed_lsn = [current_wal confirm_write];
+
+		if (current_wal->inprogress && [current_wal rows] > 0) {
+			/* invariant: .xlog must have at least one valid row
+			   rename .xlog.inprogress to .xlog only after [confirm_write]
+			   successfully writes some rows.
+			   it's ok to discard rows on rename failure: they are not confirmed yet */
+
+			if ([current_wal inprogress_rename] != 0) {
+				unlink(current_wal->filename);
+				[current_wal free];
+				current_wal = nil;
+				return lsn;
+			}
+
+			say_info("created `%s'", current_wal->filename);
+			[wal_to_close close];
+			wal_to_close = nil;
+		}
+
+		lsn = confirmed_lsn;
+
+		ev_tstamp fsync_delay = current_wal->dir->fsync_delay;
+		if (fsync_delay >= 0 && ev_now() - last_flush >= fsync_delay) {
+			/* note: [flush] silently drops unwritten rows.
+			   it's ok here because of previous call to [confirm_write] */
+			if ([current_wal flush] < 0) {
+				say_syserror("can't flush wal");
+			} else {
+				ev_now_update();
+				last_flush = ev_now();
+			}
+		}
+
+		if (current_wal->dir->rows_per_file <= [current_wal rows] ||
+		    (lsn + 1) % current_wal->dir->rows_per_file == 0)
+		{
+			wal_to_close = current_wal;
+			current_wal = nil;
+		}
+	}
+
+	return lsn;
+}
+
+@end
+
 void
 wal_disk_writer_input_dispatch(va_list ap __attribute__((unused)))
 {
@@ -74,11 +168,200 @@ wal_disk_writer_input_dispatch(va_list ap __attribute__((unused)))
 	}
 }
 
+int
+wal_disk_writer(int fd, void *state)
+{
+	WALDiskWriter *writer = [[WALDiskWriter alloc] init:state];
+
+	struct tbuf rbuf = TBUF(NULL, 0, fiber->pool);
+	int result = EXIT_FAILURE;
+	i64 start_lsn, next_scn = 0;
+	u32 crc;
+	bool io_failure = false, delay_read = false;
+	ssize_t r;
+	int requests_processed, rows_processed;
+	struct {
+		struct fiber *sender;
+		u32 fid;
+		u32 row_count;
+	} request[1024];
+	struct {
+		i64 lsn, scn;
+		u32 crc;
+	} row[nelem(request) * 8];
+
+	ev_tstamp start_time = ev_now();
+	palloc_register_gc_root(fiber->pool, &rbuf, tbuf_gc);
+
+	struct wal_conf { i64 lsn; i64 scn; u32 run_crc; } __attribute__((packed)) wal_conf;
+	if ((r = recv(fd, &wal_conf, sizeof(wal_conf), 0)) != sizeof(wal_conf)) {
+		if (r == 0) {
+			result = EX_OK;
+			goto exit;
+		}
+		say_syserror("recv: failed");
+		panic("unable to start WAL writer");
+	}
+	writer->lsn = wal_conf.lsn;
+	next_scn = wal_conf.scn;
+	crc = wal_conf.run_crc;
+	say_debug("%s: configured LSN:%"PRIi64 " SCN:%"PRIi64" run_crc_log:0x%x",
+		  __func__, wal_conf.lsn, wal_conf.scn, wal_conf.run_crc);
+
+	/* since wal_writer have bidirectional communiction to master
+	   and checks for errors on send/recv,
+	   there is no need in util.m:keepalive() */
+	signal(SIGPIPE, SIG_IGN);
+
+	/* ignore SIGUSR1, so accidental miss in 'kill -USR1' won't cause crash */
+	signal(SIGUSR1, SIG_IGN);
+
+	for (;;) {
+		if (!delay_read) {
+			tbuf_ensure(&rbuf, 16 * 1024);
+			r = tbuf_recv(&rbuf, fd);
+			if (r < 0 && (errno == EINTR))
+				continue;
+			else if (r < 0) {
+				say_syserror("recv");
+				result = EX_OSERR;
+				goto exit;
+			} else if (r == 0) {
+				result = EX_OK;
+				goto exit;
+			}
+		}
+
+
+		if (cfg.coredump > 0 && ev_now() - start_time > cfg.coredump * 60) {
+			maximize_core_rlimit();
+			cfg.coredump = 0;
+		}
+
+		start_lsn = writer->lsn;
+		requests_processed = 0;
+		rows_processed = 0;
+		delay_read = false;
+		io_failure = [writer prepare_write:next_scn + 1] == -1;
+
+		/* we're not running inside ev_loop, so update ev_now manually just before write */
+		ev_now_update();
+
+		for (int i = 0; i < nelem(request); i++) {
+			if (tbuf_len(&rbuf) < sizeof(u32) ||
+			    tbuf_len(&rbuf) < *(u32 *)rbuf.ptr)
+				break;
+
+			u32 row_count = ((u32 *)rbuf.ptr)[1];
+			u32 rows_available = MIN([writer->current_wal wet_rows_offset_available],
+						 nelem(row) - rows_processed);
+			if (!io_failure && row_count > rows_available) {
+				assert(requests_processed != 0);
+				delay_read = true;
+				break;
+			}
+
+			tbuf_ltrim(&rbuf, sizeof(u32)); /* drop packet_len */
+			request[i].row_count = read_u32(&rbuf);
+			request[i].sender = read_ptr(&rbuf);
+			request[i].fid = read_u32(&rbuf);
+
+			assert(request[i].row_count > 0);
+
+			for (int j = 0; j < request[i].row_count; j++) {
+				struct row_v12 *h = read_bytes(&rbuf, sizeof(*h));
+				void *data = read_bytes(&rbuf, h->len);
+
+				if (io_failure)
+					continue;
+
+				say_debug("%s: SCN:%"PRIi64" tag:%s data_len:%u", __func__,
+					  h->scn, xlog_tag_to_a(h->tag), h->len);
+
+				const struct row_v12 *ret = [writer append_row:h data:data];
+				if (ret == NULL) {
+					say_error("append_row failed");
+					io_failure = true;
+					continue;
+				}
+
+				int tag_type = h->tag & ~TAG_MASK;
+				int tag = h->tag & TAG_MASK;
+				if (tag_type == TAG_WAL && (tag == wal_data || tag > user_tag))
+					crc = crc32c(crc, data, h->len);
+
+				/* next_scn is used for writing XLog header, which is turn used to
+				   find correct file for replication replay.
+				   so, next_scn should be updated only when data modification occurs */
+				if (scn_changer(h->tag)) {
+					if (cfg.panic_on_scn_gap && ret->scn - next_scn != 1)
+						panic("GAP %"PRIi64" rows:%i", ret->scn - next_scn,
+						      request[requests_processed].row_count);
+					next_scn = ret->scn;
+				}
+
+				row[rows_processed].lsn = ret->lsn;
+				row[rows_processed].scn = next_scn;
+				row[rows_processed].crc = crc;
+				rows_processed++;
+			}
+			requests_processed++;
+		}
+		if (requests_processed == 0)
+			continue;
+
+		assert(start_lsn > 0);
+		u32 rows_confirmed = [writer confirm_write] - start_lsn;
+
+		size_t reply_len = sizeof(struct wal_reply) * requests_processed;
+		struct wal_reply *reply = palloc(fiber->pool, reply_len);
+		for (int i = 0, j = 0; i < requests_processed; i++) {
+			reply[i] = (struct wal_reply){ .packet_len = sizeof(struct wal_reply),
+						       .row_count = 0,
+						       .sender = request[i].sender,
+						       .fid = request[i].fid,
+						       .lsn = 0,
+						       .scn = 0};
+
+			if (rows_confirmed > 0) {
+				reply[i].row_count = MIN(rows_confirmed, request[i].row_count);
+				rows_confirmed -= reply[i].row_count;
+				j += reply[i].row_count;
+				/* row[j - 1] is the last written row in the request */
+				reply[i].lsn = row[j - 1].lsn;
+				reply[i].scn = row[j - 1].scn;
+				reply[i].run_crc = row[j - 1].crc;
+			}
+			say_debug("%s: reply[%i] rows:%i LSN:%"PRIi64" SCN:%"PRIi64,
+				  __func__, i, reply[i].row_count, reply[i].lsn, reply[i].scn);
+		}
+		do {
+			r = write(fd, reply, reply_len);
+			if (r < 0) {
+				if (errno == EINTR)
+					continue;
+				/* parent is dead, exit quetly */
+				result = EX_OK;
+				goto exit;
+			}
+			reply = (void *)reply + r;
+			reply_len -= r;
+		} while (reply_len > 0);
+
+		fiber_gc();
+	}
+exit:
+	[writer->current_wal close];
+	writer->current_wal = nil;
+	return result;
+}
+
 
 @implementation XLogWriter
 
 - (i64) lsn { return lsn; }
 - (i64) scn { return scn; }
+- (u32) run_crc_log { return run_crc_log; }
 - (struct child *) wal_writer { return wal_writer; };
 
 - (void) set_lsn:(i64)lsn_ { lsn = lsn_; }
@@ -97,15 +380,6 @@ configure_wal_writer
 	configured = true;
 }
 
-- (int)
-submit:(id<Txn>)txn
-{
-	struct wal_pack pack;
-	wal_pack_prepare(self, &pack);
-	[txn append:&pack];
-	return [self wal_pack_submit];
-}
-
 
 - (int)
 submit:(const void *)data len:(u32)data_len tag:(u16)tag
@@ -118,6 +392,14 @@ submit:(const void *)data len:(u32)data_len tag:(u16)tag
 		return 0;
 
 	wal_pack_append_row(&pack, &row);
+
+	/* this conversion is for box only. no other module
+	   should ever use cfg.io_compat */
+	if (cfg.io_compat && (tag & ~TAG_MASK) == TAG_WAL) {
+		u16 op = (tag & TAG_MASK) >> 5;
+		row.tag = wal_data|TAG_WAL;
+		wal_pack_append_data(&pack, &row, &op, sizeof(op));
+	}
 	wal_pack_append_data(&pack, &row, data, data_len);
 	return [self wal_pack_submit];
 }
@@ -169,8 +451,11 @@ wal_pack_submit
 	ev_io_start(&wal_writer->c->out);
 	struct wal_reply *reply = yield();
 	assert(reply->lsn != -1);
-	if (reply->lsn == 0)
+	if (reply->lsn == 0) {
 		say_warn("wal writer returned error status");
+		assert(reply->row_count == 0);
+		return 0;
+	}
 
 	if (cfg.sync_scn_with_lsn && reply->lsn != reply->scn)
 		panic("out ouf sync SCN:%"PRIi64 " != LSN:%"PRIi64,
@@ -186,263 +471,32 @@ wal_pack_submit
 	return reply->row_count;
 }
 
-- (i64)
-append_row:(const void *)data len:(u32)data_len scn:(i64)scn_ tag:(u16)tag cookie:(u64)cookie
+- (SnapWriter *)
+snap_writer
 {
-	return [current_wal append_row:data len:data_len scn:scn_ tag:tag cookie:cookie];
+	if (snap_writer)
+		return snap_writer;
+	snap_writer = [[SnapWriter alloc] init_state:self snap_dir:snap_dir];
+	return snap_writer;
 }
 
 - (int)
-prepare_write:(i64)scn_
+write_initial_state
 {
-	if (current_wal == nil)
-		current_wal = [wal_dir open_for_write:lsn + 1 scn:scn_];
-
-        if (current_wal == nil) {
-                say_error("can't open wal");
-                return -1;
-        }
-
-	return 0;
+	lsn = scn = 1;
+	return [[self snap_writer] snapshot_write];
 }
+@end
 
-- (i64)
-confirm_write
+@implementation SnapWriter
+
+- (id)
+init_state:(id<RecoveryState>)state_ snap_dir:(XLogDir *)snap_dir_
 {
-	static ev_tstamp last_flush;
-
-	if (current_wal != nil) {
-		i64 confirmed_lsn = [current_wal confirm_write];
-
-		if (current_wal->inprogress && [current_wal rows] > 0) {
-			/* invariant: .xlog must have at least one valid row
-			   rename .xlog.inprogress to .xlog only after [confirm_write]
-			   successfully writes some rows.
-			   it's ok to discard rows on rename failure: they are not confirmed yet */
-
-			if ([current_wal inprogress_rename] != 0) {
-				unlink(current_wal->filename);
-				[current_wal free];
-				current_wal = nil;
-				return lsn;
-			}
-
-			say_info("created `%s'", current_wal->filename);
-			[wal_to_close close];
-			wal_to_close = nil;
-		}
-
-		lsn = confirmed_lsn;
-
-		ev_tstamp fsync_delay = current_wal->dir->fsync_delay;
-		if (fsync_delay >= 0 && ev_now() - last_flush >= fsync_delay) {
-			if ([current_wal flush] < 0) {
-				say_syserror("can't flush wal");
-			} else {
-				ev_now_update();
-				last_flush = ev_now();
-			}
-		}
-
-		if (current_wal->dir->rows_per_file <= [current_wal rows] ||
-		    (lsn + 1) % current_wal->dir->rows_per_file == 0)
-		{
-			wal_to_close = current_wal;
-			current_wal = nil;
-		}
-	}
-
-	return lsn;
-}
-
-
-int
-wal_disk_writer(int fd, void *state)
-{
-	XLogWriter *writer = state;
-	struct tbuf *wbuf, rbuf = TBUF(NULL, 0, fiber->pool);
-	int result = EXIT_FAILURE;
-	i64 start_lsn, next_scn = 0;
-	u32 crc, requests_processed;
-	bool io_failure = false, have_unwritten_rows = false;
-	ssize_t r;
-	struct {
-		struct fiber *sender;
-		u32 fid;
-		u32 row_count;
-		u32 run_crc; /* run_crc is computed */
-		i64 scn;
-	} *request = xmalloc(sizeof(*request) * 1024);
-	bool broken[1024];
-
-	ev_tstamp start_time = ev_now();
-	palloc_register_gc_root(fiber->pool, &rbuf, tbuf_gc);
-
-	struct wal_conf { i64 lsn; i64 scn; u32 run_crc; } __attribute__((packed)) wal_conf;
-	if ((r = recv(fd, &wal_conf, sizeof(wal_conf), 0)) != sizeof(wal_conf)) {
-		if (r == 0) {
-			result = EX_OK;
-			goto exit;
-		}
-		say_syserror("recv: failed");
-		panic("unable to start WAL writer");
-	}
-	[writer set_lsn:wal_conf.lsn];
-	next_scn = wal_conf.scn;
-	crc = wal_conf.run_crc;
-	say_debug("%s: configured LSN:%"PRIi64 " SCN:%"PRIi64" run_crc_log:0x%x",
-		  __func__, wal_conf.lsn, wal_conf.scn, wal_conf.run_crc);
-
-	/* since wal_writer have bidirectional communiction to master
-	   and checks for errors on send/recv,
-	   there is no need in util.m:keepalive() */
-	signal(SIGPIPE, SIG_IGN);
-
-	for (;;) {
-		if (!have_unwritten_rows) {
-			tbuf_ensure(&rbuf, 16 * 1024);
-			r = recv(fd, rbuf.end, tbuf_free(&rbuf), 0);
-			if (r < 0 && (errno == EINTR))
-				continue;
-			else if (r < 0) {
-				say_syserror("recv");
-				result = EX_OSERR;
-				goto exit;
-			} else if (r == 0) {
-				result = EX_OK;
-				goto exit;
-			}
-			tbuf_append(&rbuf, NULL, r);
-		}
-
-
-		if (cfg.coredump > 0 && ev_now() - start_time > cfg.coredump * 60) {
-			maximize_core_rlimit();
-			cfg.coredump = 0;
-		}
-
-		start_lsn = [writer lsn];
-		requests_processed = 0;
-		have_unwritten_rows = false;
-		io_failure = [writer prepare_write:next_scn] == -1;
-
-		/* we're not running inside ev_loop, so update ev_now manually just before write */
-		ev_now_update();
-
-		while (tbuf_len(&rbuf) > sizeof(u32) && tbuf_len(&rbuf) >= *(u32 *)rbuf.ptr &&
-		       requests_processed < 1024)
-		{
-			u32 row_count = ((u32 *)rbuf.ptr)[1];
-			if (!io_failure && row_count > [writer->current_wal wet_rows_offset_available]) {
-				assert(requests_processed != 0);
-				have_unwritten_rows = true;
-				break;
-			}
-
-			tbuf_ltrim(&rbuf, sizeof(u32)); /* drop packet_len */
-			broken[requests_processed] = 0;
-			request[requests_processed].row_count = read_u32(&rbuf);
-			request[requests_processed].sender = read_ptr(&rbuf);
-			request[requests_processed].fid = read_u32(&rbuf);
-
-			for (int i = 0; i < request[requests_processed].row_count; i++) {
-				struct row_v12 *h = read_bytes(&rbuf, sizeof(*h));
-				void *data = read_bytes(&rbuf, h->len);
-
-				if (io_failure)
-					continue;
-
-				say_debug("%s: SCN:%"PRIi64" tag:%s data_len:%u", __func__,
-					  h->scn, xlog_tag_to_a(h->tag), h->len);
-
-				/* FIXME: use packed repr! */
-				i64 ret = [writer append_row:data
-							 len:h->len
-							 scn:h->scn
-							 tag:h->tag
-						      cookie:h->cookie];
-				if (ret <= 0) {
-					say_error("append_row failed");
-					io_failure = true;
-					continue;
-				}
-
-				int tag = h->tag & TAG_MASK;
-				int tag_type = h->tag & ~TAG_MASK;
-				if (tag_type == TAG_WAL && (tag == wal_tag || tag > user_tag))
-					crc = crc32c(crc, data, h->len);
-
-				/* next_scn is used for writing XLog header, which is turn used to
-				   find correct file for replication replay.
-				   so, next_scn should be updated only when data modification occurs */
-				if (tag_type == TAG_WAL) {
-					if (h->scn > 100 && h->scn - next_scn != 1) {
-						say_warn("GAP %i rows:%i", (int)(h->scn - next_scn),
-							 request[requests_processed].row_count);
-						broken[requests_processed] = true;
-					}
-					next_scn = h->scn;
-				}
-
-				request[requests_processed].run_crc = crc;
-				request[requests_processed].scn = next_scn;
-			}
-			requests_processed++;
-		}
-		if (requests_processed == 0)
-			continue;
-
-		assert(start_lsn > 0);
-		u32 rows_confirmed = [writer confirm_write] - start_lsn;
-
-		wbuf = tbuf_alloc(fiber->pool);
-		for (int i = 0; i < requests_processed; i++) {
-			struct wal_reply reply = { .packet_len = sizeof(reply),
-						   .row_count = 0,
-						   .sender = request[i].sender,
-						   .fid = request[i].fid,
-						   .lsn = 0,
-						   .scn = 0,
-						   .run_crc = request[i].run_crc };
-
-			if (rows_confirmed > 0) {
-				reply.row_count = MIN(rows_confirmed, request[i].row_count);
-				rows_confirmed -= reply.row_count;
-				start_lsn += reply.row_count;
-				reply.lsn = start_lsn;
-				reply.scn = request[i].scn ?: reply.lsn;
-
-				if (broken[i]) {
-					reply.lsn = -1;
-					reply.scn = -1;
-				}
-			}
-
-			tbuf_append(wbuf, &reply, sizeof(reply));
-
-			say_debug("%s: wrote rows:%i  maxLSN:%"PRIi64,
-				  __func__, reply.row_count, reply.lsn);
-		}
-
-
-		do {
-			ssize_t r = write(fd, wbuf->ptr, tbuf_len(wbuf));
-			if (r < 0) {
-				if (errno == EINTR)
-					continue;
-				/* parent is dead, exit quetly */
-				result = EX_OK;
-				goto exit;
-			}
-			tbuf_ltrim(wbuf, r);
-		} while (tbuf_len(wbuf) > 0);
-
-		fiber_gc();
-	}
-exit:
-	[writer->current_wal close];
-	writer->current_wal = nil;
-	return result;
+	[super init];
+	state = state_;
+	snap_dir = snap_dir_;
+	return self;
 }
 
 int
@@ -451,9 +505,9 @@ snapshot_write_row(XLog *l, u16 tag, struct tbuf *row)
 	static int bytes;
 	ev_tstamp elapsed;
 	static ev_tstamp last = 0;
-	const int io_rate_limit = l->dir->writer->snap_io_rate_limit;
+	const int io_rate_limit = cfg.snap_io_rate_limit * 1024 * 1024;
 
-	if ([l append_row:row->ptr len:tbuf_len(row) scn:0 tag:(tag | TAG_SNAP)] < 0) {
+	if ([l append_row:row->ptr len:tbuf_len(row) scn:0 tag:tag|TAG_SNAP] == NULL) {
 		say_syserror("unable write row");
 		return -1;
 	}
@@ -511,8 +565,8 @@ snapshot_write
 {
         XLog *snap;
 
-	say_debug("%s: lsn:%"PRIi64" scn:%"PRIi64, __func__, lsn, scn);
-	snap = [snap_dir open_for_write:lsn scn:scn];
+	say_debug("%s: lsn:%"PRIi64" scn:%"PRIi64, __func__, [state lsn], [state scn]);
+	snap = [snap_dir open_for_write:[state lsn] scn:[state scn]];
 	if (snap == nil) {
 		say_syserror("can't open snap for writing");
 		return -1;
@@ -535,11 +589,12 @@ snapshot_write
 	struct tbuf *snap_ini = tbuf_alloc(fiber->pool);
 	u32 rows = [self snapshot_estimate];
 	tbuf_append(snap_ini, &rows, sizeof(rows));
+	u32 run_crc_log = [state run_crc_log];
 	tbuf_append(snap_ini, &run_crc_log, sizeof(run_crc_log));
 	u32 run_crc_mod = 0;
 	tbuf_append(snap_ini, &run_crc_mod, sizeof(run_crc_mod));
 
-	if ([snap append_row:snap_ini->ptr len:tbuf_len(snap_ini) scn:scn tag:(snap_initial_tag | TAG_SNAP)] < 0) {
+	if ([snap append_row:snap_ini->ptr len:tbuf_len(snap_ini) scn:[state scn] tag:snap_initial|TAG_SYS] == NULL) {
 		say_error("unable write initial row");
 		return -1;
 	}
@@ -551,7 +606,7 @@ snapshot_write
 		return -1;
 
 	const char end[] = "END";
-	if ([snap append_row:end len:strlen(end) scn:scn tag:(snap_final_tag | TAG_SNAP)] < 0) {
+	if ([snap append_row:end len:strlen(end) scn:[state scn] tag:snap_final|TAG_SYS] == NULL) {
 		say_error("unable write final row");
 		return -1;
 	}
@@ -589,8 +644,9 @@ snapshot:(bool)sync
 		return -1;
 
 	case 0: /* child, the dumper */
+		current_module = NULL;
 		fiber->name = "dumper";
-		set_proc_title("dumper (%" PRIu32 ")", getppid());
+		title("dumper (%" PRIu32 ")", getppid());
 		fiber_destroy_all();
 		palloc_unmap_unused();
 		close_all_xcpt(2, stderrfd, sayfd);
@@ -607,12 +663,6 @@ snapshot:(bool)sync
 	}
 }
 
-- (int)
-snapshot_initial
-{
-	lsn = scn = 1;
-	return [self snapshot_write];
-}
 
 @end
 

@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2011 Mail.RU
- * Copyright (C) 2011 Yuriy Vostrikov
+ * Copyright (C) 2011, 2012, 2013, 2014 Mail.RU
+ * Copyright (C) 2011, 2012, 2013, 2014 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -115,10 +115,12 @@ typedef union {
 struct iproto_handler {
 	iproto_cb cb;
 	int flags;
+	int code;
 };
 
 struct service {
 	struct palloc_pool *pool;
+	size_t pool_allocated; /* used for differential calls to palloc_gc */
 	const char *name;
 	TAILQ_HEAD(conn_tailq, conn) processing;
 	LIST_HEAD(, conn) conn;
@@ -126,8 +128,27 @@ struct service {
 	SLIST_HEAD(, fiber) workers; /* <- handlers */
 	int batch;
 	ev_prepare wakeup;
-	struct iproto_handler ih[256];
+	struct iproto_handler default_handler;
+	int ih_size, ih_mask;
+	struct iproto_handler *ih;
 };
+#define SERVICE_DEFAULT_CAPA 0x100
+
+void service_set_handler(struct service *s, struct iproto_handler h);
+
+static inline struct iproto_handler*
+service_find_code(struct service *s, int code)
+{
+	int pos = code & s->ih_mask;
+	if (s->ih[pos].code == code) return &s->ih[pos];
+	if (s->ih[pos].code == -1) return &s->default_handler;
+	int dlt = (code % s->ih_mask) | 1;
+	do {
+		pos = (pos + dlt) & s->ih_mask;
+		if (s->ih[pos].code == code) return &s->ih[pos];
+	} while(s->ih[pos].code != -1);
+	return &s->default_handler;
+}
 
 
 void netmsg_head_init(struct netmsg_head *h, struct palloc_pool *pool) LUA_DEF;
@@ -135,12 +156,13 @@ void netmsg_head_release(struct netmsg_head *h) LUA_DEF;
 
 struct netmsg *netmsg_concat(struct netmsg_head *dst, struct netmsg_head *src) LUA_DEF;
 void netmsg_release(struct netmsg_head *h, struct netmsg *m) LUA_DEF;
-void netmsg_rewind(struct netmsg_head *h, struct netmsg_mark *mark) LUA_DEF;
+void netmsg_rewind(struct netmsg_head *h, const struct netmsg_mark *mark) LUA_DEF;
 void netmsg_getmark(struct netmsg_head *h, struct netmsg_mark *mark) LUA_DEF;
 
 void net_add_iov(struct netmsg_head *o, const void *buf, size_t len) LUA_DEF;
 struct iovec *net_reserve_iov(struct netmsg_head *o) LUA_DEF;
 void net_add_iov_dup(struct netmsg_head *o, const void *buf, size_t len) LUA_DEF;
+#define net_add_dup(o, buf) net_add_iov_dup(o, (buf), sizeof(*(buf)))
 void net_add_ref_iov(struct netmsg_head *o, uintptr_t ref, const void *buf, size_t len) LUA_DEF;
 void net_add_obj_iov(struct netmsg_head *o, struct tnt_object *obj, const void *buf, size_t len) LUA_DEF;
 void netmsg_verify_ownership(struct netmsg_head *h); /* debug method */
@@ -172,7 +194,16 @@ enum tac_state  tcp_async_connect(struct conn *c, ev_watcher *w,
 				ev_tstamp		timeout);
 
 int tcp_connect(struct sockaddr_in *dst, struct sockaddr_in *src, ev_tstamp timeout);
+struct tcp_server_state {
+	const char *addr;
+	void (*handler)(int fd, void *data, struct tcp_server_state *state);
+	void (*on_bind)(int fd);
+	void *data;
+	struct sockaddr_in saddr;
+	ev_io io;
+};
 void tcp_server(va_list ap);
+void tcp_server_stop(struct tcp_server_state *state);
 void udp_server(va_list ap);
 int server_socket(int type, struct sockaddr_in *src, int nonblock,
 		  void (*on_bind)(int fd), void (*sleep)(ev_tstamp tm));
@@ -192,4 +223,5 @@ void service_info(struct tbuf *out, struct service *service);
 void luaT_opennet(struct lua_State *L);
 int luaT_pushnetmsg(struct lua_State *L);
 
+void title(const char *fmt, ...);
 #endif

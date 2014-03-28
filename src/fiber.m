@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2010, 2011, 2012 Mail.RU
- * Copyright (C) 2010, 2011, 2012 Yuriy Vostrikov
+ * Copyright (C) 2010, 2011, 2012, 2013, 2014 Mail.RU
+ * Copyright (C) 2010, 2011, 2012, 2013, 2014 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -65,7 +65,8 @@ void *watcher;
 int events;
 static uint32_t last_used_fid;
 
-ev_prepare wake_prep;
+static ev_prepare wake_prep;
+static ev_async wake_async;
 
 static struct mhash_t *fibers_registry;
 
@@ -254,8 +255,6 @@ fiber_create(const char *name, void (*f)(va_list va), ...)
 		SLIST_REMOVE_HEAD(&zombie_fibers, zombie_link);
 	} else {
 		new = xcalloc(1, sizeof(*fiber));
-		if (new == NULL)
-			return NULL;
 
 		if (octopus_coro_create(&new->coro, fiber_loop, NULL) == NULL)
 			return NULL;
@@ -310,7 +309,6 @@ struct child *
 spawn_child(const char *name, struct fiber *in, struct fiber *out,
 	    int (*handler)(int fd, void *state), void *state)
 {
-	char *child_name;
 	int one = 1, socks[2];
 	int pid;
 
@@ -338,13 +336,14 @@ spawn_child(const char *name, struct fiber *in, struct fiber *out,
 
 		return child;
 	} else {
+		extern id recovery;
+		recovery = nil;
 		salloc_destroy();
 		close_all_xcpt(3, socks[0], stderrfd, sayfd);
-		child_name = xmalloc(64);
-		snprintf(child_name, 64, "%s/child", name);
-		sched.name = child_name;
-		set_proc_title("%s%s", name, custom_proc_title);
-		say_info("%s initialized", name);
+		assert(fiber == &sched);
+		sched.name = name;
+		title("%s", name);
+		say_info("%s spawned", name);
 		_exit(handler(socks[0], state));
 	}
 }
@@ -370,11 +369,18 @@ fiber_wakeup_pending(void)
 	assert(fiber == &sched);
 	struct fiber *f, *tvar;
 
-	TAILQ_FOREACH_SAFE(f, &wake_list, wake_link, tvar) {
-		void *arg = f->wake;
-		TAILQ_REMOVE(&wake_list, f, wake_link);
-		f->wake_link.tqe_prev = NULL;
-		resume(f, arg);
+	for(int i=10; i && !TAILQ_EMPTY(&wake_list); i--) {
+		TAILQ_FOREACH_SAFE(f, &wake_list, wake_link, tvar) {
+			void *arg = f->wake;
+			TAILQ_REMOVE(&wake_list, f, wake_link);
+			f->wake_link.tqe_prev = NULL;
+			resume(f, arg);
+		}
+	}
+
+	if (!TAILQ_EMPTY(&wake_list)) {
+		zero_io_collect_interval();
+		ev_async_send(&wake_async);
 	}
 }
 
@@ -397,6 +403,8 @@ fiber_init(void)
 
 	ev_prepare_init(&wake_prep, (void *)fiber_wakeup_pending);
 	ev_prepare_start(&wake_prep);
+	ev_async_init(&wake_async, (void *)unzero_io_collect_interval);
+	ev_async_start(&wake_async);
 	say_debug("fibers initialized");
 }
 
@@ -406,11 +414,13 @@ luaT_fiber_trampoline(va_list ap)
 	struct lua_State *pL = va_arg(ap, struct lua_State *),
 			  *L = fiber->L;
 
+	lua_pushcfunction(L, luaT_traceback);
 	lua_xmove(pL, L, 1);
-	if (lua_pcall(L, 0, 0, 0) != 0) {
+	if (lua_pcall(L, 0, 0, -2) != 0) {
 		say_error("lua_pcall(): %s", lua_tostring(L, -1));
 		lua_pop(L, 1);
 	}
+	lua_pop(L, 1);
 }
 
 static int
@@ -434,9 +444,16 @@ luaT_fiber_sleep(struct lua_State *L)
 }
 
 static int
-luaT_fiber_gc(struct lua_State *L __attribute__((unused)))
+luaT_fiber_gc(struct lua_State *L _unused_)
 {
 	fiber_gc();
+	return 0;
+}
+
+static int
+luaT_fiber_yield(struct lua_State *L _unused_)
+{
+	yield();
 	return 0;
 }
 
@@ -445,6 +462,7 @@ static const struct luaL_reg fiberlib [] = {
 	{"create", luaT_fiber_create},
 	{"sleep", luaT_fiber_sleep},
 	{"gc", luaT_fiber_gc},
+	{"yield", luaT_fiber_yield},
 	{NULL, NULL}
 };
 

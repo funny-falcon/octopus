@@ -32,7 +32,6 @@ user_proc.get_all_tuples = box.wrap(function (n, i)
         end
 
 	if i == nil then i = 0 end
-
         -- iterate over all chunks
         for restart in next_chunk, object_space.index[i] do
                 fiber.sleep(0.001)
@@ -126,10 +125,10 @@ user_proc.sum_u64 = box.wrap(function (n, pk)
         if not obj then
                 return 0, {"not found"}
         end
-        
+
         local t = box.ctuple(obj);
         local f, offt, len = {}, 0
-        for i = 0,t[0].cardinality - 1 do 
+        for i = 0,t[0].cardinality - 1 do
                 len, offt = box.decode_varint32(t[0].data, offt)
                 if len == 8 then
                         table.insert(f, ffi.cast("uint64_t *", t[0].data + offt)[0])
@@ -191,3 +190,91 @@ user_proc.iterator = box.wrap(function (n, key, limit)
 
         return 0, result
 end)
+
+
+local function test1()
+   return 0, {box.tuple("abc", "defg", "foobar"),
+	      box.tuple("abc", "defg"),
+	      box.tuple("abc")}
+end
+
+local function test0()
+   return 0, {box.tuple("abc", "defg", "foobar"),
+	      box.tuple("abc", "defg"),
+	      box.tuple("abc")}
+end
+
+local function tos(s)
+   return tostring(s):gsub("0x%w+", "0xPTR")
+end
+
+local function test2()
+   local os = box.object_space[0]
+   local legacy_pk = os.index[0]
+   local new_pk = os:index(0)
+
+   local a = tos(legacy_pk)
+   local b = tos(new_pk)
+   return 0, {box.tuple(a, b)}
+end
+
+local function test3()
+   local os = box.object_space[0]
+   local pk = os:index(0)
+
+   local t = pk:find("11")
+   return 0, {box.tuple(tos(t), t:strfield(0), t[0])}
+end
+
+local function test4()
+    local os = box.object_space[0]
+    local pk = os:index(0)
+
+    local k = {}
+    for i = 0,1000 do
+	k[i] = tostring(i)
+    end
+
+    local n = 0
+    for i = 0,1000 do
+	local t = pk:find(k[i])
+	if t ~= nil then
+	    n = n + 1
+	end
+    end
+
+    local idx = os:index(1)
+    for i = 0,1000 do
+	local t = idx:find(k[i], i, k[i])
+	if t ~= nil then
+	    n = n + 1
+	end
+    end
+
+    for i = 0,1000 do
+	local t = idx:find(k[i], i)
+	if t ~= nil then
+	    n = n + 1
+	end
+    end
+
+    return 0, {box.tuple(tostring(n))}
+end
+
+local function test5()
+    local os = box.object_space[1]
+    local a = os:index(0):find(0)
+    local b = os:index(1):find(0)
+    local c = os:index(2):find(0)
+    local d = os:index(3):find(0)
+    return 0, {a,b,c,d}
+end
+
+local function test6()
+    return 0, {box.replace(0, "\0\0\0\0", "\0\0\0\0", "\0\0\0\0")}
+end
+
+user_proc.test0 = box.wrap(test0)
+for i, f in ipairs({test1, test2, test3, test4, test5, test6}) do
+   user_proc["test" .. tostring(i)] = box.wrap(f)
+end

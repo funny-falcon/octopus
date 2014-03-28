@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2011 Mail.RU
- * Copyright (C) 2011 Yuriy Vostrikov
+ * Copyright (C) 2011, 2013 Mail.RU
+ * Copyright (C) 2011, 2013 Yuriy Vostrikov
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -27,7 +27,7 @@
 #ifndef OBJECT_H
 #define OBJECT_H
 
-#import <objc/Object.h>
+#include <objc/Object.h>
 #include <palloc.h>
 #include <util.h>
 
@@ -49,21 +49,21 @@
 
 @interface Error : Object {
 @public
-	char *reason;
+	const char *reason;
 	char buf[1024];
 	unsigned line;
 	const char *file;
 	char *backtrace;
 }
-- (Error *)init:(char *)reason;
-- (Error *)init_line:(unsigned)line_
-		file:(const char *)file_
-	   backtrace:(const char *)backtrace_
-	      reason:(const char *)reason_;
-- (Error *)init_line:(unsigned)line
-		file:(const char *)file
-	   backtrace:(const char *)backtrace
-	      format:(const char *)format, ...;
+- init:(const char *)reason;
+- init_line:(unsigned)line_
+       file:(const char *)file_
+  backtrace:(const char *)backtrace_
+     reason:(const char *)reason_;
+- init_line:(unsigned)line
+       file:(const char *)file
+  backtrace:(const char *)backtrace
+     format:(const char *)format, ...;
 @end
 
 

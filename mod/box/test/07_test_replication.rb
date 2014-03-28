@@ -30,21 +30,29 @@ EOD
   file "feeder_init.lua" do
     f = open("feeder_init.lua", "w")
     f.write <<-EOD
-      function replication_filter.id_xlog(obj)
-        local row = feeder.crow(obj)
-        print("row lsn:" .. tostring(row.lsn) ..
-              " scn:" .. tostring(row.scn) ..
-              " tag:" .. row.tag ..
-              " cookie:" .. tostring(row.cookie) ..
-              " tm:" .. row.tm)
+local ffi = require('ffi')
+local box_old_nop = "\1\0\0\0\0\0"
+local box_nop = "\0\0\0\0"
+ffi.cdef 'void *malloc(int)'
+local buf = ffi.C.malloc(1024)
+function replication_filter.id_xlog(row)
+    print(row)
 
-        local box_nop = "\01\00\00\00\00\00"
-
-        if row.scn == 3296 or row.scn == 3297 or row.scn == 3298 then
-                return box_nop
+    if row.scn == 3296 or row.scn == 3297 or row.scn == 3298 then
+	local new = ffi.new('struct row_v12 *', buf)
+	ffi.copy(new, row, ffi.sizeof('struct row_v12'))
+	if row.tag == 0x8003 then
+            new.len = #box_old_nop
+            ffi.copy(new.data, box_old_nop, #box_old_nop)
+        else
+            new.tag = 0x8033 -- NOP|TAG_WAL
+	    new.len = #box_nop
+	    ffi.copy(new.data, box_nop, #box_nop)
         end
-        return true
-      end
+	return new
+    end
+    return true
+end
     EOD
     f.close
   end

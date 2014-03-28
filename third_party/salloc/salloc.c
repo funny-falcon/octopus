@@ -77,7 +77,17 @@ void __asan_unpoison_memory_region(void const volatile *addr, size_t size);
 #ifndef TYPEALIGN
 #define TYPEALIGN(ALIGNVAL,LEN)  \
         (((uintptr_t) (LEN) + ((ALIGNVAL) - 1)) & ~((uintptr_t) ((ALIGNVAL) - 1)))
-#define CACHEALIGN(LEN)			TYPEALIGN(32, (LEN))
+#endif
+
+#define CACHEALIGN(LEN)	TYPEALIGN(32, (LEN))
+
+#if defined(__SANITIZE_ADDRESS__)
+#ifndef SLAB_DEBUG
+# define SLAB_DEBUG
+#endif
+# define SALLOC_ALIGN(ptr) (void *)TYPEALIGN(8, ptr)
+#else
+# define SALLOC_ALIGN(ptr) ptr
 #endif
 
 #ifndef OCTOPUS
@@ -100,8 +110,10 @@ uint8_t red_zone[8] = { 0xfa, 0xfa, 0xfa, 0xfa, 0xfa, 0xfa, 0xfa, 0xfa };
 uint8_t red_zone[0] = { };
 #endif
 
+int salloc_error;
+
 static const uint32_t SLAB_MAGIC = 0x51abface;
-static const size_t MAX_SLAB_ITEM = 1 << 20;
+static const size_t MAX_SLAB_ITEM = SLAB_SIZE / 4;
 static size_t page_size;
 
 struct slab_item {
@@ -159,6 +171,7 @@ slab_cache_init(struct slab_cache *cache, size_t item_size, enum arena_type type
 	assert(item_size <= MAX_SLAB_ITEM);
 	cache->item_size = item_size > sizeof(void *) ? item_size : sizeof(void *);
 	cache->name = name;
+	cache->ctor = cache->dtor = NULL;
 
 	switch (type) {
 	case SLAB_FIXED:
@@ -166,6 +179,8 @@ slab_cache_init(struct slab_cache *cache, size_t item_size, enum arena_type type
 		cache->arena = fixed_arena; break;
 	case SLAB_GROW:
 		cache->arena = grow_arena; break;
+	default:
+		abort();
 	}
 
 	TAILQ_INIT(&cache->slabs);
@@ -185,7 +200,7 @@ slab_cache_series_init(enum arena_type arena_type, size_t minimal, double factor
 	     i < nelem(slab_caches) - 1 && size <= MAX_SLAB_ITEM;
 	     i++)
 	{
-		slab_cache_init(&slab_caches[i], size - sizeof(red_zone), arena_type, NULL);
+		slab_cache_init(&slab_caches[i], size, arena_type, NULL);
 
 		size = MAX((size_t)(size * factor) & ~(ptr_size - 1),
 			   (size + ptr_size) & ~(ptr_size - 1));
@@ -333,6 +348,9 @@ format_slab(struct slab_cache *cache, struct slab *slab)
 	slab->brk = (void *)CACHEALIGN((void *)slab + sizeof(struct slab));
 
 	ASAN_POISON_MEMORY_REGION(slab->brk, SLAB_SIZE - (slab->brk - (void *)slab), 0xfa);
+
+	slab->brk = SALLOC_ALIGN(slab->brk + sizeof(red_zone));
+
 	TAILQ_INSERT_HEAD(&cache->slabs, slab, cache_link);
 	TAILQ_INSERT_HEAD(&cache->partial_populated_slabs, slab, cache_partial_link);
 }
@@ -368,6 +386,7 @@ cache_for(size_t size)
 		if (slab_caches[i].item_size >= size)
 			return &slab_caches[i];
 
+	salloc_error = ESALLOC_NOCACHE;
 	return NULL;
 }
 
@@ -396,6 +415,7 @@ slab_of(struct slab_cache *cache)
 		return slab;
 	}
 
+	salloc_error = ESALLOC_NOMEM;
 	return NULL;
 }
 
@@ -421,9 +441,12 @@ slab_cache_alloc(struct slab_cache *cache)
 		assert(valid_item(slab, slab->brk));
 		item = slab->brk;
 		ASAN_UNPOISON_MEMORY_REGION(item, cache->item_size + sizeof(red_zone));
+		VALGRIND_MAKE_MEM_UNDEFINED((void *)item + cache->item_size, sizeof(red_zone));
 		memcpy((void *)item + cache->item_size, red_zone, sizeof(red_zone));
 		ASAN_POISON_MEMORY_REGION((void *)item + cache->item_size, sizeof(red_zone), 0xfb);
-		slab->brk += cache->item_size + sizeof(red_zone);
+		/* we can leave slab here in case of last item has been allocated
+		    and align has been occured */
+		slab->brk = SALLOC_ALIGN(slab->brk + cache->item_size + sizeof(red_zone));
 		if (cache->ctor)
 			cache->ctor(item);
 	} else {
@@ -498,7 +521,7 @@ sfree(void *ptr)
 	}
 
 	ASAN_POISON_MEMORY_REGION(item, cache->item_size, 0xfd);
-	VALGRIND_FREELIKE_BLOCK(iqtem, sizeof(red_zone));
+	VALGRIND_FREELIKE_BLOCK(item, sizeof(red_zone));
 }
 
 void
